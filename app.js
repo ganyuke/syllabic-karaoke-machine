@@ -2,8 +2,9 @@ const APP_ID = 'syllable-karaoke-studio';
 const APP_VERSION = 2;
 const DB_NAME = 'syllable-karaoke-studio-db';
 const DB_STORE = 'projects';
-const AUTOSAVE_KEY = 'autosave';
-
+const AUTOSAVE_STATE_KEY = 'autosave_state';
+const AUTOSAVE_AUDIO_KEY = 'autosave_audio';
+const AUTOSAVE_INTERVAL = 450;
 const DEMO_LYRICS = `[Verse]
 ka-ra-o-ke ga su-ki
 
@@ -110,6 +111,8 @@ const runtime = {
   resizeObserver: null,
   loadingProject: false,
   drawDirty: true,
+  lyricsDirty: true,
+  lastTransportTime: -1,
   selectedPitchGhost: 60,
   audioOverlay: {
     metronomeCursorAudioTime: null,
@@ -294,6 +297,10 @@ function markDirty() {
   runtime.drawDirty = true;
 }
 
+function markLyricsDirty() {
+  runtime.lyricsDirty = true;
+}
+
 function getAudioDuration() {
   if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
     return els.audioPlayer.duration;
@@ -422,12 +429,9 @@ async function putAutosave() {
   }
   const db = await openDb();
   const payload = {
-    id: AUTOSAVE_KEY,
+    id: AUTOSAVE_STATE_KEY,
     savedAt: Date.now(),
     project: serializeProject(),
-    audioDataUrl: audioBlob ? await blobToDataUrl(audioBlob) : null,
-    audioName: audioBlob ? (audioBlob.name || state.audioMeta.name || 'audio-file') : null,
-    audioType: audioBlob ? (audioBlob.type || state.audioMeta.type || 'audio/*') : null,
   };
   await new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, 'readwrite');
@@ -439,6 +443,19 @@ async function putAutosave() {
   updateSaveStatus(`Autosaved locally at ${new Date().toLocaleTimeString()}.`);
 }
 
+async function putAutosaveAudio(file) {
+  if (!file) return;
+  const db = await openDb();
+  
+  const record = {
+    id: AUTOSAVE_AUDIO_KEY,
+    file: file 
+  };
+
+  const tx = db.transaction(DB_STORE, 'readwrite');
+  await tx.objectStore(DB_STORE).put(record);
+}
+
 function scheduleAutosave() {
   clearTimeout(runtime.autosaveTimer);
   runtime.autosaveTimer = setTimeout(() => {
@@ -446,34 +463,36 @@ function scheduleAutosave() {
       console.error(error);
       updateSaveStatus('Autosave failed.');
     });
-  }, 450);
+  }, AUTOSAVE_INTERVAL);
 }
 
 async function loadAutosave() {
   try {
     const db = await openDb();
-    const record = await new Promise((resolve, reject) => {
-      const tx = db.transaction(DB_STORE, 'readonly');
-      const request = tx.objectStore(DB_STORE).get(AUTOSAVE_KEY);
+    const tx = db.transaction(DB_STORE, 'readonly');
+    const store = tx.objectStore(DB_STORE);
+
+    const getRecord = (key) => new Promise((resolve, reject) => {
+      const request = store.get(key);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
-    if (!record || !record.project) {
+
+    const [stateRecord, audioRecord] = await Promise.all([
+      getRecord(AUTOSAVE_STATE_KEY),
+      getRecord(AUTOSAVE_AUDIO_KEY)
+    ]);
+
+    if (!stateRecord || !stateRecord.project) {
       updateSaveStatus('No autosaved project yet.');
       return;
     }
-    let restoredBlob = null;
-    if (record.audioDataUrl) {
-      restoredBlob = await dataUrlToBlob(record.audioDataUrl);
-      if (record.audioName) {
-        restoredBlob = new File([restoredBlob], record.audioName, { type: record.audioType || restoredBlob.type || 'audio/*' });
-      }
-    } else if (record.audioBlob) {
-      // legacy records that stored the blob directly
-      restoredBlob = record.audioBlob;
-    }
-    await hydrateProject(record.project, restoredBlob, { fromAutosave: true });
-    updateSaveStatus(`Loaded autosaved project from ${new Date(record.savedAt).toLocaleString()}.`);
+
+    const restoredBlob = audioRecord ? audioRecord.file : null;
+
+    await hydrateProject(stateRecord.project, restoredBlob, { fromAutosave: true });
+    updateSaveStatus(`Loaded autosaved project from ${new Date(stateRecord.savedAt).toLocaleString()}.`);
+    
   } catch (error) {
     console.error(error);
     updateSaveStatus('Could not access local project storage.');
@@ -485,7 +504,8 @@ async function clearAutosave() {
     const db = await openDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(DB_STORE, 'readwrite');
-      tx.objectStore(DB_STORE).delete(AUTOSAVE_KEY);
+      tx.objectStore(DB_STORE).delete(AUTOSAVE_STATE_KEY);
+      tx.objectStore(DB_STORE).delete(AUTOSAVE_AUDIO_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
@@ -494,7 +514,6 @@ async function clearAutosave() {
     console.error(error);
   }
 }
-
 function updateSaveStatus(text) {
   els.saveStatus.textContent = text;
 }
@@ -606,6 +625,7 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
   refreshAudioMeta();
   fitViewToSong();
   resetAudioOverlayState();
+  if (!preservePlaybackPosition) putAutosaveAudio(blob); 
   markDirty();
   scheduleAutosave();
 }
@@ -1487,19 +1507,22 @@ function drawWaveform(ctx, width, height) {
   }
   const duration = Math.max(getAudioDuration(), getProjectMaxTime());
   const mid = height / 2;
+  const peaksLen = peaks.length;
+  const viewStart = runtime.view.start;
+  const viewDuration = runtime.view.duration;
   ctx.save();
   ctx.strokeStyle = 'rgba(115, 164, 255, 0.8)';
   ctx.lineWidth = 1;
+  ctx.beginPath();
   for (let x = 0; x < width; x += 1) {
-    const time = xToTime(x, width, 0);
-    const peakIndex = clamp(Math.floor((time / duration) * peaks.length), 0, peaks.length - 1);
-    const peak = peaks[peakIndex] || 0;
-    const amplitude = peak * (height * 0.46);
-    ctx.beginPath();
-    ctx.moveTo(x + 0.5, mid - amplitude);
-    ctx.lineTo(x + 0.5, mid + amplitude);
-    ctx.stroke();
+    const time = viewStart + (x / width) * viewDuration;
+    const peakIndex = clamp(Math.floor((time / duration) * peaksLen), 0, peaksLen - 1);
+    const amplitude = (peaks[peakIndex] || 0) * (height * 0.46);
+    const px = x + 0.5;
+    ctx.moveTo(px, mid - amplitude);
+    ctx.lineTo(px, mid + amplitude);
   }
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -1521,6 +1544,8 @@ function drawTimelineBlocks(ctx, width, height) {
   const trackY = height - TIMELINE_TRACK_HEIGHT;
   const trackHeight = TIMELINE_TRACK_HEIGHT - 8;
   const selected = getSelectionEntry();
+  const soundingEntry = getCurrentSoundingEntry();
+  const font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
   runtime.index.syllables.forEach((entry) => {
     if (!isFiniteNumber(entry.syllable.start)) {
       return;
@@ -1538,7 +1563,7 @@ function drawTimelineBlocks(ctx, width, height) {
     const w = Math.max(3, x2 - x1);
     const y = trackY;
     const isSelected = selected?.id === entry.id;
-    const isSounding = getCurrentSoundingEntry()?.id === entry.id;
+    const isSounding = soundingEntry?.id === entry.id;
     ctx.save();
     ctx.fillStyle = isSounding ? 'rgba(243, 181, 98, 0.8)' : isSelected ? 'rgba(115, 164, 255, 0.82)' : 'rgba(87, 215, 178, 0.52)';
     ctx.strokeStyle = isSelected ? 'rgba(255,255,255,0.82)' : 'rgba(255,255,255,0.18)';
@@ -1557,7 +1582,7 @@ function drawTimelineBlocks(ctx, width, height) {
     }
     if (w > 20) {
       ctx.fillStyle = 'rgba(7, 11, 22, 0.8)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+      ctx.font = font;
       ctx.fillText(entry.syllable.text, x1 + 6, y + trackHeight / 2 + 4);
     }
     ctx.restore();
@@ -1627,18 +1652,19 @@ function drawOverview() {
   const peaks = state.waveformPeaks || [];
   if (peaks.length) {
     const mid = height / 2;
+    const peaksLen = peaks.length;
     ctx.save();
     ctx.strokeStyle = 'rgba(115, 164, 255, 0.75)';
     ctx.lineWidth = 1;
+    ctx.beginPath();
     for (let x = 0; x < width; x += 1) {
-      const peakIndex = clamp(Math.floor((x / width) * peaks.length), 0, peaks.length - 1);
-      const peak = peaks[peakIndex] || 0;
-      const amplitude = peak * (height * 0.44);
-      ctx.beginPath();
-      ctx.moveTo(x + 0.5, mid - amplitude);
-      ctx.lineTo(x + 0.5, mid + amplitude);
-      ctx.stroke();
+      const peakIndex = clamp(Math.floor((x / width) * peaksLen), 0, peaksLen - 1);
+      const amplitude = (peaks[peakIndex] || 0) * (height * 0.44);
+      const px = x + 0.5;
+      ctx.moveTo(px, mid - amplitude);
+      ctx.lineTo(px, mid + amplitude);
     }
+    ctx.stroke();
     ctx.restore();
   }
   const viewportX = (runtime.view.start / fullDuration) * width;
@@ -1693,6 +1719,10 @@ function drawPitchGuide() {
   const rowCount = Math.max(1, maxPitch - minPitch + 1);
   const rowHeight = (height - 16) / rowCount;
   const selectedEntry = getSelectionEntry();
+  const soundingEntry = getCurrentSoundingEntry();
+  const bodyFont = getComputedStyle(document.body).fontFamily;
+  const labelFont = `${10 * (window.devicePixelRatio || 1)}px ${bodyFont}`;
+  const noteFont = `${11 * (window.devicePixelRatio || 1)}px ${bodyFont}`;
   runtime.pitchHitboxes = [];
 
   ctx.save();
@@ -1702,14 +1732,13 @@ function drawPitchGuide() {
     ctx.fillStyle = isBlack ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.08)';
     ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
     ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+    ctx.font = labelFont;
     ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
   }
   ctx.restore();
 
   drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
 
-  const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
     const start = entry.syllable.start;
     const end = getEffectiveSyllableEnd(entry.globalIndex);
@@ -1745,7 +1774,7 @@ function drawPitchGuide() {
     ctx.setLineDash([]);
     if (w > 28) {
       ctx.fillStyle = 'rgba(6, 10, 22, 0.82)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+      ctx.font = noteFont;
       ctx.fillText(`${entry.syllable.text} · ${noteNameFromMidi(pitch)}`, x1 + 6, y + h * 0.66);
     }
     ctx.restore();
@@ -1949,6 +1978,8 @@ function afterTimingMutation({ ensureViewTime = null, skipSelectionUpdate = fals
   }
   if (!skipSelectionUpdate) {
     updateLyricsDynamic();
+  } else {
+    markLyricsDirty();
   }
   markDirty();
   scheduleAutosave();
@@ -2762,9 +2793,21 @@ function animate() {
   applyLooping();
   scheduleMetronomeClicks();
   updateGuideVoice();
-  updateTransportUi();
-  updateLyricsDynamic();
-  if (runtime.drawDirty || !els.audioPlayer.paused || runtime.drag) {
+
+  const isPlaying = !els.audioPlayer.paused;
+  const currentTime = getCurrentTime();
+
+  if (isPlaying || currentTime !== runtime.lastTransportTime) {
+    updateTransportUi();
+    runtime.lastTransportTime = currentTime;
+  }
+
+  if (isPlaying || runtime.lyricsDirty) {
+    updateLyricsDynamic();
+    runtime.lyricsDirty = false;
+  }
+
+  if (runtime.drawDirty || isPlaying || runtime.drag) {
     drawTimeline();
     drawOverview();
     drawPitchGuide();
