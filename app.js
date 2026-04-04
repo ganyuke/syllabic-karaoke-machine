@@ -1197,7 +1197,7 @@ function syncInputsFromState() {
 function updateSyncStatus() {
   const total = runtime.index.syllables.length;
   const synced = getSyncedCount();
-  els.syncStatusPill.textContent = `${synced} / ${total || 0} starts`; 
+  els.syncStatusPill.textContent = `${synced} / ${total || 0} starts`;
 }
 
 function updateSelectedEditor() {
@@ -2439,92 +2439,63 @@ async function togglePlayPause() {
   updateTransportUi();
 }
 
+/* INPUT HOTKEY HANDLING */
+
+const setTiming = (e, s) => tapFromSelected()
+const pausePlayback = (e, s) => togglePlayPause().catch(console.warn)
+const setStart = (e, s) => setSelectedStartTime(getCurrentTime())
+const setEnd = (e, s) => setSelectedEndTime(getCurrentTime())
+const seekBackward = (e, s) => seekToTime(getCurrentTime() - s.settings.seekStep, { play: false }).catch(console.warn)
+const seekForward = (e, s) => seekToTime(getCurrentTime() + s.settings.seekStep, { play: false }).catch(console.warn)
+const nudgeStart = (e, s) => nudgeSelectedStart(-s.settings.nudgeStep)
+const nudgeEnd = (e, s) => nudgeSelectedStart(s.settings.nudgeStep)
+const deleteTiming = (e, s) => clearSelectedTiming({ movePrev: false })
+const selectBack = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) - 1, { scroll: true })
+const selectFoward = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) + 1, { scroll: true })
+const backspaceHandler = (e, s) => {
+  if (s.focusRegion === 'pitch') return clearSelectedPitch();
+  if (e.shiftKey) return clearTimingsFromSelectedForward();
+  clearSelectedTiming({ movePrev: true });
+}
+const pitchUp = (e, s) => adjustSelectedPitch(e.shiftKey ? 12 : 1)
+const pitchDown = (e, s) => adjustSelectedPitch(e.shiftKey ? -12 : -1)
+
+const KEY_ACTIONS = {
+  'enter': setTiming,
+  'k': setTiming,
+  'z': setTiming, // for those who love clicking circles
+  'x': setTiming,
+  ' ': pausePlayback,
+  's': setStart,
+  'e': setEnd,
+  'j': seekBackward,
+  'l': seekForward,
+  ',': nudgeStart,
+  '.': nudgeEnd,
+  'delete': deleteTiming,
+  'backspace': backspaceHandler,
+  'arrowup': pitchUp,
+  'arrowdown': pitchDown,
+  '[': selectBack,
+  'arrowleft': selectBack,
+  ']': selectFoward,
+  'arrowright': selectFoward,
+};
+
+function isEditableTarget(target) {
+  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+    || target.isContentEditable;
+}
+
 function handleKeydown(event) {
-  const tag = event.target.tagName;
-  const editable = ['INPUT', 'TEXTAREA', 'SELECT'].includes(tag) || event.target.isContentEditable;
-  if (editable) {
-    return;
-  }
-  if (event.code === 'Space') {
-    event.preventDefault();
-    togglePlayPause().catch((error) => console.warn(error));
-    return;
-  }
-  const HOTKEY_TAP = new Set(['enter', 'k', 'z', 'x']);
+  if (isEditableTarget(event.target)) return;
+
   const key = event.key.toLowerCase();
-  if (HOTKEY_TAP.has(key)) {
+
+  const action = KEY_ACTIONS[key];
+  if (action) {
     event.preventDefault();
-    tapFromSelected();
-    return;
-  }
-  if (event.key.toLowerCase() === 's') {
-    event.preventDefault();
-    setSelectedStartTime(getCurrentTime());
-    return;
-  }
-  if (event.key.toLowerCase() === 'e') {
-    event.preventDefault();
-    setSelectedEndTime(getCurrentTime());
-    return;
-  }
-  if (event.key === '[' || event.key === 'ArrowLeft') {
-    event.preventDefault();
-    const current = getSelectionEntry();
-    selectSyllableByIndex((current?.globalIndex || 0) - 1, { scroll: true });
-    return;
-  }
-  if (event.key === ']' || event.key === 'ArrowRight') {
-    event.preventDefault();
-    const current = getSelectionEntry();
-    selectSyllableByIndex((current?.globalIndex || 0) + 1, { scroll: true });
-    return;
-  }
-  if (event.key.toLowerCase() === 'j') {
-    event.preventDefault();
-    seekToTime(getCurrentTime() - state.settings.seekStep, { play: false }).catch((error) => console.warn(error));
-    return;
-  }
-  if (event.key.toLowerCase() === 'l') {
-    event.preventDefault();
-    seekToTime(getCurrentTime() + state.settings.seekStep, { play: false }).catch((error) => console.warn(error));
-    return;
-  }
-  if (event.key === ',') {
-    event.preventDefault();
-    nudgeSelectedStart(-state.settings.nudgeStep);
-    return;
-  }
-  if (event.key === '.') {
-    event.preventDefault();
-    nudgeSelectedStart(state.settings.nudgeStep);
-    return;
-  }
-  if (event.key === 'Delete') {
-    event.preventDefault();
-    clearSelectedTiming({ movePrev: false });
-    return;
-  }
-  if (event.key === 'Backspace') {
-    event.preventDefault();
-    if (runtime.focusRegion === 'pitch') {
-      clearSelectedPitch();
-      return;
-    }
-    if (event.shiftKey) {
-      clearTimingsFromSelectedForward();
-      return;
-    }
-    clearSelectedTiming({ movePrev: true });
-    return;
-  }
-  if (event.key === 'ArrowUp') {
-    event.preventDefault();
-    adjustSelectedPitch(event.shiftKey ? 12 : 1);
-    return;
-  }
-  if (event.key === 'ArrowDown') {
-    event.preventDefault();
-    adjustSelectedPitch(event.shiftKey ? -12 : -1);
+    action(event, state);
   }
 }
 
