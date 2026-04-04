@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Syllable Karaoke Studio</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand" title="Local-first lyric sync workspace">Syllable Karaoke Studio</div>
+      <div class="topbar-group grow">
+        <label class="field compact project-name-field" title="Project name used in exports">
+          <span>Project</span>
+          <input id="projectName" type="text" placeholder="My song practice" />
+        </label>
+        <label class="file-button compact" title="Load an audio file from your computer">
+          <span>Audio</span>
+          <input id="audioFileInput" type="file" accept="audio/*" />
+        </label>
+        <label class="file-button compact" title="Import a saved project JSON">
+          <span>Import</span>
+          <input id="importProjectInput" type="file" accept="application/json,.json" />
+        </label>
+        <button id="exportProjectBtn" class="primary compact" title="Export the current project to JSON">Export</button>
+        <button id="clearProjectBtn" class="compact" title="Reset the current project and clear the autosave">Reset</button>
+        <label class="checkline compact" title="Embed the current audio file inside the exported project">
+          <input id="embedAudioInExport" type="checkbox" checked />
+          <span>Embed audio</span>
+        </label>
+      </div>
+      <div class="topbar-status">
+        <span id="audioFileName" class="meta-chip" title="Current audio file">No audio</span>
+        <span id="audioDurationLabel" class="meta-chip" title="Audio duration">0:00</span>
+        <span id="keyboardModePill" class="status-pill subtle" title="Click waveform/lyrics for timing keys or pitch roll for pitch keys">Timing keys</span>
+        <span id="saveStatus" class="save-status">Nothing saved yet.</span>
+      </div>
+      <audio id="audioPlayer" preload="metadata"></audio>
+    </header>
+
+    <section class="control-strip panel dense sticky-strip">
+      <div class="control-row wrap">
+        <button id="playPauseBtn" class="primary" title="Space">Play</button>
+        <button id="rewindBtn" title="Seek backward by the current seek step (J)">-2s</button>
+        <button id="forwardBtn" title="Seek forward by the current seek step (L)">+2s</button>
+        <button id="jumpToSelectionBtn" title="Jump to the selected syllable, word, or line with pre-roll">Jump</button>
+        <button id="loopSelectionBtn" title="Loop the selected syllable, word, or line">Loop off</button>
+        <span class="divider"></span>
+        <button id="prevSyllableBtn" title="Previous syllable ([ or ArrowLeft)">Prev</button>
+        <button id="nextSyllableBtn" title="Next syllable (] or ArrowRight)">Next</button>
+        <button id="setStartBtn" class="accent" title="Set selected syllable start to the playhead (S)">Start @ playhead</button>
+        <button id="setEndBtn" class="accent" title="Set selected syllable end to the playhead (E)">End @ playhead</button>
+        <button id="tapFromSelectedBtn" class="primary" title="Stamp the selected syllable start, then move to the next syllable (Enter or K)">Tap start → next</button>
+        <button id="clearSelectedTimeBtn" title="Clear selected start/end (Delete)">Clear timing</button>
+        <button id="clearFollowingTimesBtn" title="Clear this syllable and all following timings (Shift+Backspace)">Clear → end</button>
+        <button id="clearSelectedPitchBtn" title="Clear the selected pitch (Backspace in pitch mode, or click here)">Clear pitch</button>
+      </div>
+      <div class="control-row compact-grid">
+        <label class="field compact" title="Playback rate for practice">
+          <span>Rate</span>
+          <input id="playbackRateInput" type="range" min="0.4" max="1.25" step="0.05" value="0.8" />
+          <span id="playbackRateLabel" class="field-readout">0.80x</span>
+        </label>
+        <label class="field compact" title="Jump this much before the selected lyric when replaying it">
+          <span>Pre-roll</span>
+          <input id="preRollInput" type="range" min="0" max="1.2" step="0.02" value="0.18" />
+          <span id="preRollLabel" class="field-readout">180 ms</span>
+        </label>
+        <label class="field compact" title="Keep playback going slightly after the selection when looping">
+          <span>Loop tail</span>
+          <input id="postRollInput" type="range" min="0" max="1.2" step="0.02" value="0.08" />
+          <span id="postRollLabel" class="field-readout">80 ms</span>
+        </label>
+        <label class="field tiny" title="Seek amount used by the rewind/forward buttons and J/L hotkeys">
+          <span>Seek step (s)</span>
+          <input id="seekStepInput" type="number" min="0.1" max="30" step="0.1" value="2" />
+        </label>
+        <label class="field tiny" title="Fine nudge amount used by the timing nudge controls">
+          <span>Nudge (ms)</span>
+          <input id="nudgeStepInput" type="number" min="1" max="500" step="1" value="25" />
+        </label>
+        <label class="field compact" title="Music playback volume">
+          <span>Music</span>
+          <input id="musicVolumeInput" type="range" min="0" max="1" step="0.01" value="1" />
+          <span id="musicVolumeLabel" class="field-readout">100%</span>
+        </label>
+        <label class="field compact" title="Guide synth volume for the pitch roll">
+          <span>Guide</span>
+          <input id="guideVolumeInput" type="range" min="0" max="1" step="0.01" value="0.25" />
+          <span id="guideVolumeLabel" class="field-readout">25%</span>
+        </label>
+        <label class="checkline compact" title="Play automatically after jumping from lyrics or controls">
+          <input id="autoPlayOnJump" type="checkbox" checked />
+          <span>Auto-play</span>
+        </label>
+        <label class="checkline compact" title="Keep the active lyric line in view during playback">
+          <input id="autoScrollLyrics" type="checkbox" checked />
+          <span>Auto-scroll</span>
+        </label>
+        <div class="summary-chip" id="selectedSummary">Nothing selected</div>
+      </div>
+      <div class="scrub-row">
+        <span id="currentTimeLabel" class="time-chip">0:00.00</span>
+        <input id="scrubInput" type="range" min="0" max="1" step="0.001" value="0" />
+        <span id="remainingTimeLabel" class="time-chip">-0:00.00</span>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <aside class="sidebar stack">
+        <section class="panel dense stack gap-sm">
+          <div class="panel-heading compact-heading">
+            <strong>Lyrics source</strong>
+            <div class="button-row">
+              <button id="buildLyricsBtn" class="primary compact" title="Apply preprocessing and rebuild the lyric structure">Build</button>
+              <button id="sampleLyricsBtn" class="compact" title="Load a small demo project into the lyrics box">Demo</button>
+            </div>
+          </div>
+          <textarea id="lyricsInput" rows="14" placeholder="Paste lyrics here.
+Example manual mode:
+ka-ra-o-ke ga su-ki
+
+[Chorus]
+To-day I sing"></textarea>
+          <div class="option-grid">
+            <label class="field tiny" title="Manual mode uses visible separators like hyphens. Auto Japanese tries to split kana and romaji into mora-like syllables.">
+              <span>Split mode</span>
+              <select id="splitModeSelect">
+                <option value="manual">Manual markup</option>
+                <option value="auto-japanese">Auto Japanese</option>
+              </select>
+            </label>
+            <label class="checkline compact" title="Skip empty lines and paragraph breaks when building the editable lyric structure">
+              <input id="excludeDoubleNewlines" type="checkbox" checked />
+              <span>Ignore blank lines</span>
+            </label>
+            <label class="checkline compact" title="Skip lines like [Chorus] or [Verse 2] when building the editable lyric structure">
+              <input id="excludeSectionLabels" type="checkbox" checked />
+              <span>Ignore [Section]</span>
+            </label>
+          </div>
+          <div class="microhelp">Manual mode: spaces separate words, hyphens split syllables. Auto Japanese: kana and romaji are split heuristically into mora-like chunks.</div>
+        </section>
+
+        <section class="panel dense stack gap-sm">
+          <div class="panel-heading compact-heading">
+            <strong>Selected syllable</strong>
+            <div class="button-row">
+              <button id="jumpSelectedMiniBtn" class="compact" title="Jump to the selected practice target with pre-roll">Jump</button>
+              <button id="copyPlayheadStartBtn" class="compact" title="Copy the playhead time into the start box">Copy → start</button>
+              <button id="copyPlayheadEndBtn" class="compact" title="Copy the playhead time into the end box">Copy → end</button>
+            </div>
+          </div>
+          <div id="selectedSummaryDetail" class="selected-detail">Nothing selected</div>
+          <div class="selected-grid">
+            <label class="field tiny" title="When the selected syllable starts sounding">
+              <span>Start (s)</span>
+              <input id="selectedStartInput" type="number" min="0" step="0.01" placeholder="0.00" />
+            </label>
+            <label class="field tiny" title="When the selected syllable stops sounding. Leave blank to let it stretch until the next syllable starts.">
+              <span>End (s)</span>
+              <input id="selectedEndInput" type="number" min="0" step="0.01" placeholder="next start" />
+            </label>
+            <label class="field tiny" title="Pitch shown in the piano roll. Integer MIDI note numbers only.">
+              <span>Pitch</span>
+              <input id="selectedPitchInput" type="number" min="24" max="108" step="1" placeholder="60" />
+              <span id="selectedPitchLabel" class="field-readout">—</span>
+            </label>
+          </div>
+          <div class="button-row wrap">
+            <button id="applySelectedValuesBtn" class="compact" title="Apply the values currently typed into the start/end/pitch boxes">Apply typed values</button>
+            <button id="clearSelectedEndBtn" class="compact" title="Remove the explicit end so the syllable fills until the next start">Use next start for end</button>
+            <button id="nudgeBackLargeBtn" class="compact" title="Move the start backward by 4× the nudge step">-4×</button>
+            <button id="nudgeBackBtn" class="compact" title="Move the start backward by the nudge step (,)">-1×</button>
+            <button id="nudgeForwardBtn" class="compact" title="Move the start forward by the nudge step (.)">+1×</button>
+            <button id="nudgeForwardLargeBtn" class="compact" title="Move the start forward by 4× the nudge step">+4×</button>
+          </div>
+          <div class="microhelp">Hotkeys: Space play · Enter/K tap start→next · S/E set start/end · Backspace clear+prev · Delete clear · Shift+Backspace clear→end · ↑/↓ pitch · J/L seek</div>
+        </section>
+
+        <section class="panel dense stack gap-sm">
+          <div class="panel-heading compact-heading">
+            <strong>Metronome</strong>
+            <label class="checkline compact" title="Overlay beat clicks while the audio plays">
+              <input id="metronomeEnabled" type="checkbox" />
+              <span>On</span>
+            </label>
+          </div>
+          <div class="option-grid metronome-grid">
+            <label class="field tiny" title="Tempo in beats per minute">
+              <span>BPM</span>
+              <input id="metronomeBpm" type="number" min="20" max="300" step="1" value="96" />
+            </label>
+            <label class="field tiny" title="Offset the first beat relative to the song start">
+              <span>Offset (s)</span>
+              <input id="metronomeOffset" type="number" step="0.01" value="0" />
+            </label>
+            <label class="field tiny" title="How many beats are in each bar">
+              <span>Beats / bar</span>
+              <input id="metronomeBeatsPerBar" type="number" min="1" max="12" step="1" value="4" />
+            </label>
+            <label class="field compact" title="Metronome click volume">
+              <span>Click volume</span>
+              <input id="metronomeVolume" type="range" min="0" max="1" step="0.01" value="0.35" />
+              <span id="metronomeVolumeLabel" class="field-readout">35%</span>
+            </label>
+          </div>
+        </section>
+      </aside>
+
+      <section class="mainpane stack">
+        <section class="panel dense stack gap-sm">
+          <div class="panel-heading compact-heading">
+            <strong>Waveform timeline</strong>
+            <div class="button-row wrap">
+              <button id="zoomOutBtn" class="compact" title="Zoom out horizontally around the playhead or cursor">-</button>
+              <button id="zoomInBtn" class="compact" title="Zoom in horizontally around the playhead or cursor">+</button>
+              <button id="fitSongBtn" class="compact" title="Show the full song in the main view">Fit song</button>
+              <button id="fitSelectionBtn" class="compact" title="Zoom to the selected syllable, word, or line">Fit selection</button>
+              <span id="viewRangeLabel" class="summary-chip" title="Current visible time range">0:00 → 0:00</span>
+            </div>
+          </div>
+          <div class="canvas-wrap timeline-wrap" title="Wheel = zoom. Drag = scrub. Drag the selected block edges to edit start/end. Drag the overview box below to pan.">
+            <canvas id="timelineCanvas" aria-label="Waveform timeline" tabindex="0"></canvas>
+          </div>
+          <div class="canvas-wrap overview-wrap" title="Click to center the view. Drag the viewport to pan when zoomed in.">
+            <canvas id="overviewCanvas" aria-label="Timeline overview" tabindex="0"></canvas>
+          </div>
+        </section>
+
+        <section class="panel dense stack gap-sm">
+          <div class="panel-heading compact-heading">
+            <strong>Karaoke lyrics</strong>
+            <div class="button-row wrap">
+              <span id="syncStatusPill" class="status-pill">0 synced</span>
+              <span class="legend-chip selected">selected</span>
+              <span class="legend-chip sounding">sounding</span>
+              <span class="legend-chip done">filled</span>
+            </div>
+          </div>
+          <div id="lyricsStage" class="lyrics-stage"></div>
+        </section>
+
+        <section class="panel dense stack gap-sm">
+          <div class="panel-heading compact-heading">
+            <strong>Pitch roll</strong>
+            <div class="button-row wrap">
+              <label class="checkline compact" title="Play the pitch guide as a lightweight synth while the song runs">
+                <input id="guideSynthEnabled" type="checkbox" />
+                <span>Guide synth</span>
+              </label>
+              <label class="field tiny" title="Lowest visible pitch in the piano roll">
+                <span>Low</span>
+                <input id="pitchMinInput" type="number" min="24" max="108" step="1" value="48" />
+              </label>
+              <label class="field tiny" title="Highest visible pitch in the piano roll">
+                <span>High</span>
+                <input id="pitchMaxInput" type="number" min="24" max="108" step="1" value="76" />
+              </label>
+            </div>
+          </div>
+          <div class="canvas-wrap pitch-wrap" title="Shares the same zoom as the waveform. Drag blocks up and down to change pitch. Drag anywhere else to scrub the playhead.">
+            <canvas id="pitchCanvas" aria-label="Pitch guide" tabindex="0"></canvas>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <template id="emptyLyricsTemplate">
+    <div class="empty-state">
+      <h3>No lyrics yet</h3>
+      <p>Paste lyrics, choose preprocessing options, then build the lyric structure.</p>
+    </div>
+  </template>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
