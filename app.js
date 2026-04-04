@@ -425,7 +425,9 @@ async function putAutosave() {
     id: AUTOSAVE_KEY,
     savedAt: Date.now(),
     project: serializeProject(),
-    audioBlob,
+    audioDataUrl: audioBlob ? await blobToDataUrl(audioBlob) : null,
+    audioName: audioBlob ? (audioBlob.name || state.audioMeta.name || 'audio-file') : null,
+    audioType: audioBlob ? (audioBlob.type || state.audioMeta.type || 'audio/*') : null,
   };
   await new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, 'readwrite');
@@ -460,7 +462,17 @@ async function loadAutosave() {
       updateSaveStatus('No autosaved project yet.');
       return;
     }
-    await hydrateProject(record.project, record.audioBlob || null, { fromAutosave: true });
+    let restoredBlob = null;
+    if (record.audioDataUrl) {
+      restoredBlob = await dataUrlToBlob(record.audioDataUrl);
+      if (record.audioName) {
+        restoredBlob = new File([restoredBlob], record.audioName, { type: record.audioType || restoredBlob.type || 'audio/*' });
+      }
+    } else if (record.audioBlob) {
+      // legacy records that stored the blob directly
+      restoredBlob = record.audioBlob;
+    }
+    await hydrateProject(record.project, restoredBlob, { fromAutosave: true });
     updateSaveStatus(`Loaded autosaved project from ${new Date(record.savedAt).toLocaleString()}.`);
   } catch (error) {
     console.error(error);
@@ -2057,7 +2069,8 @@ function scheduleClick(when, accent) {
 
 function stopGuideVoice() {
   const voice = runtime.guideVoice;
-  if (!voice) {
+  if (!voice || !runtime.audioContext) {
+    runtime.guideVoice = null;
     return;
   }
   try {
