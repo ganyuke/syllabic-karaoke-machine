@@ -2,9 +2,8 @@ const APP_ID = 'syllable-karaoke-studio';
 const APP_VERSION = 2;
 const DB_NAME = 'syllable-karaoke-studio-db';
 const DB_STORE = 'projects';
-const AUTOSAVE_STATE_KEY = 'autosave_state';
-const AUTOSAVE_AUDIO_KEY = 'autosave_audio';
-const AUTOSAVE_INTERVAL = 450;
+const AUTOSAVE_KEY = 'autosave';
+
 const DEMO_LYRICS = `[Verse]
 ka-ra-o-ke ga su-ki
 
@@ -111,8 +110,6 @@ const runtime = {
   resizeObserver: null,
   loadingProject: false,
   drawDirty: true,
-  lyricsDirty: true,
-  lastTransportTime: -1,
   selectedPitchGhost: 60,
   audioOverlay: {
     metronomeCursorAudioTime: null,
@@ -297,10 +294,6 @@ function markDirty() {
   runtime.drawDirty = true;
 }
 
-function markLyricsDirty() {
-  runtime.lyricsDirty = true;
-}
-
 function getAudioDuration() {
   if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
     return els.audioPlayer.duration;
@@ -429,9 +422,10 @@ async function putAutosave() {
   }
   const db = await openDb();
   const payload = {
-    id: AUTOSAVE_STATE_KEY,
+    id: AUTOSAVE_KEY,
     savedAt: Date.now(),
     project: serializeProject(),
+    audioBlob,
   };
   await new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, 'readwrite');
@@ -443,19 +437,6 @@ async function putAutosave() {
   updateSaveStatus(`Autosaved locally at ${new Date().toLocaleTimeString()}.`);
 }
 
-async function putAutosaveAudio(file) {
-  if (!file) return;
-  const db = await openDb();
-  
-  const record = {
-    id: AUTOSAVE_AUDIO_KEY,
-    file: file 
-  };
-
-  const tx = db.transaction(DB_STORE, 'readwrite');
-  await tx.objectStore(DB_STORE).put(record);
-}
-
 function scheduleAutosave() {
   clearTimeout(runtime.autosaveTimer);
   runtime.autosaveTimer = setTimeout(() => {
@@ -463,36 +444,24 @@ function scheduleAutosave() {
       console.error(error);
       updateSaveStatus('Autosave failed.');
     });
-  }, AUTOSAVE_INTERVAL);
+  }, 450);
 }
 
 async function loadAutosave() {
   try {
     const db = await openDb();
-    const tx = db.transaction(DB_STORE, 'readonly');
-    const store = tx.objectStore(DB_STORE);
-
-    const getRecord = (key) => new Promise((resolve, reject) => {
-      const request = store.get(key);
+    const record = await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, 'readonly');
+      const request = tx.objectStore(DB_STORE).get(AUTOSAVE_KEY);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });
-
-    const [stateRecord, audioRecord] = await Promise.all([
-      getRecord(AUTOSAVE_STATE_KEY),
-      getRecord(AUTOSAVE_AUDIO_KEY)
-    ]);
-
-    if (!stateRecord || !stateRecord.project) {
+    if (!record || !record.project) {
       updateSaveStatus('No autosaved project yet.');
       return;
     }
-
-    const restoredBlob = audioRecord ? audioRecord.file : null;
-
-    await hydrateProject(stateRecord.project, restoredBlob, { fromAutosave: true });
-    updateSaveStatus(`Loaded autosaved project from ${new Date(stateRecord.savedAt).toLocaleString()}.`);
-    
+    await hydrateProject(record.project, record.audioBlob || null, { fromAutosave: true });
+    updateSaveStatus(`Loaded autosaved project from ${new Date(record.savedAt).toLocaleString()}.`);
   } catch (error) {
     console.error(error);
     updateSaveStatus('Could not access local project storage.');
@@ -504,8 +473,7 @@ async function clearAutosave() {
     const db = await openDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(DB_STORE, 'readwrite');
-      tx.objectStore(DB_STORE).delete(AUTOSAVE_STATE_KEY);
-      tx.objectStore(DB_STORE).delete(AUTOSAVE_AUDIO_KEY);
+      tx.objectStore(DB_STORE).delete(AUTOSAVE_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
@@ -514,6 +482,7 @@ async function clearAutosave() {
     console.error(error);
   }
 }
+
 function updateSaveStatus(text) {
   els.saveStatus.textContent = text;
 }
@@ -625,7 +594,6 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
   refreshAudioMeta();
   fitViewToSong();
   resetAudioOverlayState();
-  if (!preservePlaybackPosition) putAutosaveAudio(blob); 
   markDirty();
   scheduleAutosave();
 }
@@ -1456,10 +1424,7 @@ function xToTime(x, width, gutter = 0) {
 }
 
 function drawBackground(ctx, width, height) {
-  const gradient = ctx.createLinearGradient(0, 0, 0, height);
-  gradient.addColorStop(0, '#0b1020');
-  gradient.addColorStop(1, '#141b32');
-  ctx.fillStyle = gradient;
+  ctx.fillStyle = '#faf7f2';
   ctx.fillRect(0, 0, width, height);
 }
 
@@ -1485,7 +1450,7 @@ function drawBeatGrid(ctx, width, height, { gutter = 0, alpha = 0.18 } = {}) {
     }
     const x = timeToX(beatTime, width, gutter);
     const major = ((beatIndex % beatsPerBar) + beatsPerBar) % beatsPerBar === 0;
-    ctx.strokeStyle = major ? `rgba(243, 181, 98, ${alpha + 0.12})` : `rgba(255, 255, 255, ${alpha})`;
+    ctx.strokeStyle = major ? `rgba(200, 100, 30, ${alpha + 0.22})` : `rgba(0, 0, 0, ${alpha})`;
     ctx.lineWidth = major ? 1.4 : 1;
     ctx.beginPath();
     ctx.moveTo(x, 0);
@@ -1499,7 +1464,7 @@ function drawWaveform(ctx, width, height) {
   const peaks = state.waveformPeaks || [];
   if (!peaks.length) {
     ctx.save();
-    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
     ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
     ctx.fillText('Load audio to show the waveform.', 16, height / 2);
     ctx.restore();
@@ -1507,22 +1472,19 @@ function drawWaveform(ctx, width, height) {
   }
   const duration = Math.max(getAudioDuration(), getProjectMaxTime());
   const mid = height / 2;
-  const peaksLen = peaks.length;
-  const viewStart = runtime.view.start;
-  const viewDuration = runtime.view.duration;
   ctx.save();
-  ctx.strokeStyle = 'rgba(115, 164, 255, 0.8)';
+  ctx.strokeStyle = 'rgba(30, 90, 200, 0.55)';
   ctx.lineWidth = 1;
-  ctx.beginPath();
   for (let x = 0; x < width; x += 1) {
-    const time = viewStart + (x / width) * viewDuration;
-    const peakIndex = clamp(Math.floor((time / duration) * peaksLen), 0, peaksLen - 1);
-    const amplitude = (peaks[peakIndex] || 0) * (height * 0.46);
-    const px = x + 0.5;
-    ctx.moveTo(px, mid - amplitude);
-    ctx.lineTo(px, mid + amplitude);
+    const time = xToTime(x, width, 0);
+    const peakIndex = clamp(Math.floor((time / duration) * peaks.length), 0, peaks.length - 1);
+    const peak = peaks[peakIndex] || 0;
+    const amplitude = peak * (height * 0.46);
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, mid - amplitude);
+    ctx.lineTo(x + 0.5, mid + amplitude);
+    ctx.stroke();
   }
-  ctx.stroke();
   ctx.restore();
 }
 
@@ -1534,7 +1496,7 @@ function drawTimelineSelectionRange(ctx, width, height) {
   const x1 = timeToX(range.start, width);
   const x2 = timeToX(range.end, width);
   ctx.save();
-  ctx.fillStyle = 'rgba(115, 164, 255, 0.12)';
+  ctx.fillStyle = 'rgba(30, 90, 200, 0.09)';
   ctx.fillRect(x1, 0, Math.max(1, x2 - x1), height);
   ctx.restore();
 }
@@ -1544,8 +1506,6 @@ function drawTimelineBlocks(ctx, width, height) {
   const trackY = height - TIMELINE_TRACK_HEIGHT;
   const trackHeight = TIMELINE_TRACK_HEIGHT - 8;
   const selected = getSelectionEntry();
-  const soundingEntry = getCurrentSoundingEntry();
-  const font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
   runtime.index.syllables.forEach((entry) => {
     if (!isFiniteNumber(entry.syllable.start)) {
       return;
@@ -1563,17 +1523,17 @@ function drawTimelineBlocks(ctx, width, height) {
     const w = Math.max(3, x2 - x1);
     const y = trackY;
     const isSelected = selected?.id === entry.id;
-    const isSounding = soundingEntry?.id === entry.id;
+    const isSounding = getCurrentSoundingEntry()?.id === entry.id;
     ctx.save();
-    ctx.fillStyle = isSounding ? 'rgba(243, 181, 98, 0.8)' : isSelected ? 'rgba(115, 164, 255, 0.82)' : 'rgba(87, 215, 178, 0.52)';
-    ctx.strokeStyle = isSelected ? 'rgba(255,255,255,0.82)' : 'rgba(255,255,255,0.18)';
+    ctx.fillStyle = isSounding ? 'rgba(210, 90, 20, 0.88)' : isSelected ? 'rgba(30, 90, 200, 0.82)' : 'rgba(20, 160, 100, 0.55)';
+    ctx.strokeStyle = isSelected ? 'rgba(10, 50, 160, 0.9)' : 'rgba(0,0,0,0.12)';
     ctx.lineWidth = isSelected ? 1.8 : 1;
     roundRect(ctx, x1, y, w, trackHeight, 7);
     ctx.fill();
     ctx.stroke();
     if (!isFiniteNumber(entry.syllable.end)) {
       ctx.setLineDash([4, 4]);
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.38)';
+      ctx.strokeStyle = 'rgba(0, 0, 0, 0.28)';
       ctx.beginPath();
       ctx.moveTo(x2, y + 3);
       ctx.lineTo(x2, y + trackHeight - 3);
@@ -1581,8 +1541,8 @@ function drawTimelineBlocks(ctx, width, height) {
       ctx.setLineDash([]);
     }
     if (w > 20) {
-      ctx.fillStyle = 'rgba(7, 11, 22, 0.8)';
-      ctx.font = font;
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
       ctx.fillText(entry.syllable.text, x1 + 6, y + trackHeight / 2 + 4);
     }
     ctx.restore();
@@ -1615,7 +1575,7 @@ function drawTimelineBlocks(ctx, width, height) {
         h: trackHeight,
       });
       ctx.save();
-      ctx.fillStyle = 'rgba(255,255,255,0.95)';
+      ctx.fillStyle = 'rgba(10, 50, 180, 0.95)';
       ctx.fillRect(x1 - 1, y - 1, 2, trackHeight + 2);
       ctx.fillRect(x2 - 1, y - 1, 2, trackHeight + 2);
       ctx.restore();
@@ -1626,7 +1586,7 @@ function drawTimelineBlocks(ctx, width, height) {
 function drawPlayhead(ctx, width, height, { gutter = 0 } = {}) {
   const x = timeToX(getCurrentTime(), width, gutter);
   ctx.save();
-  ctx.strokeStyle = 'rgba(255, 108, 108, 0.95)';
+  ctx.strokeStyle = 'rgba(200, 30, 30, 0.9)';
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(x, 0);
@@ -1652,19 +1612,18 @@ function drawOverview() {
   const peaks = state.waveformPeaks || [];
   if (peaks.length) {
     const mid = height / 2;
-    const peaksLen = peaks.length;
     ctx.save();
-    ctx.strokeStyle = 'rgba(115, 164, 255, 0.75)';
+    ctx.strokeStyle = 'rgba(30, 90, 200, 0.55)';
     ctx.lineWidth = 1;
-    ctx.beginPath();
     for (let x = 0; x < width; x += 1) {
-      const peakIndex = clamp(Math.floor((x / width) * peaksLen), 0, peaksLen - 1);
-      const amplitude = (peaks[peakIndex] || 0) * (height * 0.44);
-      const px = x + 0.5;
-      ctx.moveTo(px, mid - amplitude);
-      ctx.lineTo(px, mid + amplitude);
+      const peakIndex = clamp(Math.floor((x / width) * peaks.length), 0, peaks.length - 1);
+      const peak = peaks[peakIndex] || 0;
+      const amplitude = peak * (height * 0.44);
+      ctx.beginPath();
+      ctx.moveTo(x + 0.5, mid - amplitude);
+      ctx.lineTo(x + 0.5, mid + amplitude);
+      ctx.stroke();
     }
-    ctx.stroke();
     ctx.restore();
   }
   const viewportX = (runtime.view.start / fullDuration) * width;
@@ -1676,13 +1635,13 @@ function drawOverview() {
     h: height,
   };
   ctx.save();
-  ctx.fillStyle = 'rgba(115, 164, 255, 0.18)';
+  ctx.fillStyle = 'rgba(30, 90, 200, 0.1)';
   ctx.fillRect(viewportX, 0, viewportW, height);
-  ctx.strokeStyle = 'rgba(255,255,255,0.82)';
+  ctx.strokeStyle = 'rgba(30, 90, 200, 0.8)';
   ctx.lineWidth = 2;
   ctx.strokeRect(viewportX, 1, viewportW, height - 2);
   const playheadX = (getCurrentTime() / fullDuration) * width;
-  ctx.strokeStyle = 'rgba(255, 108, 108, 0.95)';
+  ctx.strokeStyle = 'rgba(200, 30, 30, 0.9)';
   ctx.beginPath();
   ctx.moveTo(playheadX, 0);
   ctx.lineTo(playheadX, height);
@@ -1719,26 +1678,23 @@ function drawPitchGuide() {
   const rowCount = Math.max(1, maxPitch - minPitch + 1);
   const rowHeight = (height - 16) / rowCount;
   const selectedEntry = getSelectionEntry();
-  const soundingEntry = getCurrentSoundingEntry();
-  const bodyFont = getComputedStyle(document.body).fontFamily;
-  const labelFont = `${10 * (window.devicePixelRatio || 1)}px ${bodyFont}`;
-  const noteFont = `${11 * (window.devicePixelRatio || 1)}px ${bodyFont}`;
   runtime.pitchHitboxes = [];
 
   ctx.save();
   for (let pitch = maxPitch; pitch >= minPitch; pitch -= 1) {
     const y = pitchToY(pitch, minPitch, maxPitch, height);
     const isBlack = [1, 3, 6, 8, 10].includes(((pitch % 12) + 12) % 12);
-    ctx.fillStyle = isBlack ? 'rgba(255,255,255,0.04)' : 'rgba(255,255,255,0.08)';
+    ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
     ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = labelFont;
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
+    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
     ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
   }
   ctx.restore();
 
   drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
 
+  const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
     const start = entry.syllable.start;
     const end = getEffectiveSyllableEnd(entry.globalIndex);
@@ -1757,13 +1713,13 @@ function drawPitchGuide() {
     const isSounding = soundingEntry?.id === entry.id;
     ctx.save();
     ctx.fillStyle = shouldShowGhost
-      ? 'rgba(255,255,255,0.12)'
+      ? 'rgba(0,0,0,0.08)'
       : isSounding
-        ? 'rgba(243, 181, 98, 0.85)'
+        ? 'rgba(210, 90, 20, 0.88)'
         : isSelected
-          ? 'rgba(115, 164, 255, 0.85)'
-          : 'rgba(87, 215, 178, 0.62)';
-    ctx.strokeStyle = shouldShowGhost ? 'rgba(255,255,255,0.65)' : 'rgba(7, 11, 22, 0.6)';
+          ? 'rgba(30, 90, 200, 0.85)'
+          : 'rgba(20, 160, 100, 0.65)';
+    ctx.strokeStyle = shouldShowGhost ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.7)';
     ctx.lineWidth = shouldShowGhost ? 1.8 : 1;
     if (shouldShowGhost) {
       ctx.setLineDash([6, 4]);
@@ -1773,8 +1729,8 @@ function drawPitchGuide() {
     ctx.stroke();
     ctx.setLineDash([]);
     if (w > 28) {
-      ctx.fillStyle = 'rgba(6, 10, 22, 0.82)';
-      ctx.font = noteFont;
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
       ctx.fillText(`${entry.syllable.text} · ${noteNameFromMidi(pitch)}`, x1 + 6, y + h * 0.66);
     }
     ctx.restore();
@@ -1978,8 +1934,6 @@ function afterTimingMutation({ ensureViewTime = null, skipSelectionUpdate = fals
   }
   if (!skipSelectionUpdate) {
     updateLyricsDynamic();
-  } else {
-    markLyricsDirty();
   }
   markDirty();
   scheduleAutosave();
@@ -2100,8 +2054,7 @@ function scheduleClick(when, accent) {
 
 function stopGuideVoice() {
   const voice = runtime.guideVoice;
-  if (!voice || !runtime.audioContext) {
-    runtime.guideVoice = null;
+  if (!voice) {
     return;
   }
   try {
@@ -2793,21 +2746,9 @@ function animate() {
   applyLooping();
   scheduleMetronomeClicks();
   updateGuideVoice();
-
-  const isPlaying = !els.audioPlayer.paused;
-  const currentTime = getCurrentTime();
-
-  if (isPlaying || currentTime !== runtime.lastTransportTime) {
-    updateTransportUi();
-    runtime.lastTransportTime = currentTime;
-  }
-
-  if (isPlaying || runtime.lyricsDirty) {
-    updateLyricsDynamic();
-    runtime.lyricsDirty = false;
-  }
-
-  if (runtime.drawDirty || isPlaying || runtime.drag) {
+  updateTransportUi();
+  updateLyricsDynamic();
+  if (runtime.drawDirty || !els.audioPlayer.paused || runtime.drag) {
     drawTimeline();
     drawOverview();
     drawPitchGuide();
