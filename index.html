@@ -249,29 +249,32 @@ Auto-JP: カラオケが好き"></textarea>
 
     <main class="mainpane">
 
-      <!-- WAVEFORM — always open, not collapsible (it's the primary editing surface) -->
-      <section class="canvas-section">
-        <div class="section-bar">
+      <!-- WAVEFORM — collapsible manually managed div structure -->
+      <div class="main-section is-open">
+        <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Waveform</span>
-          <div class="section-bar__right">
+          <div class="section-bar__right" onclick="event.stopPropagation()">
             <button id="zoomOutBtn"      class="btn btn-ghost btn-xs">−</button>
             <button id="zoomInBtn"       class="btn btn-ghost btn-xs">+</button>
             <button id="fitSongBtn"      class="btn btn-ghost btn-xs">Fit song</button>
             <button id="fitSelectionBtn" class="btn btn-ghost btn-xs">Fit sel</button>
             <span id="viewRangeLabel" class="view-range">0:00 → 0:00</span>
           </div>
+          <span class="section-bar__arrow">▾</span>
         </div>
-        <div class="canvas-body timeline-wrap">
-          <canvas id="timelineCanvas" aria-label="Waveform timeline" tabindex="0"></canvas>
+        <div class="section-body">
+          <div class="canvas-body timeline-wrap">
+            <canvas id="timelineCanvas" aria-label="Waveform timeline" tabindex="0"></canvas>
+          </div>
+          <div class="canvas-body overview-wrap">
+            <canvas id="overviewCanvas" aria-label="Timeline overview" tabindex="0"></canvas>
+          </div>
         </div>
-        <div class="canvas-body overview-wrap">
-          <canvas id="overviewCanvas" aria-label="Timeline overview" tabindex="0"></canvas>
-        </div>
-      </section>
+      </div>
 
-      <!-- LYRICS — collapsible -->
-      <details class="main-section" open>
-        <summary class="section-bar section-bar--clickable">
+      <!-- LYRICS — collapsible manually managed div structure -->
+      <div class="main-section main-section--flex is-open">
+        <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Lyrics</span>
           <div class="section-bar__right" onclick="event.stopPropagation()">
             <span id="syncStatusPill" class="tag tag--sync">0 / 0 starts</span>
@@ -280,13 +283,15 @@ Auto-JP: カラオケが好き"></textarea>
             <span class="legend done-legend">filled</span>
           </div>
           <span class="section-bar__arrow">▾</span>
-        </summary>
-        <div id="lyricsStage" class="lyrics-stage"></div>
-      </details>
+        </div>
+        <div class="section-body">
+          <div id="lyricsStage" class="lyrics-stage"></div>
+        </div>
+      </div>
 
-      <!-- PITCH ROLL — collapsible -->
-      <details class="main-section main-section--flex" open>
-        <summary class="section-bar section-bar--clickable">
+      <!-- PITCH ROLL — collapsible manually managed div structure -->
+      <div class="main-section main-section--flex is-open">
+        <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Pitch roll</span>
           <div class="section-bar__right" onclick="event.stopPropagation()">
             <label class="check-pair" title="Play guide synth">
@@ -303,11 +308,13 @@ Auto-JP: カラオケが好き"></textarea>
             </label>
           </div>
           <span class="section-bar__arrow">▾</span>
-        </summary>
-        <div class="canvas-body pitch-wrap">
-          <canvas id="pitchCanvas" aria-label="Pitch guide" tabindex="0"></canvas>
         </div>
-      </details>
+        <div class="section-body">
+          <div class="canvas-body pitch-wrap">
+            <canvas id="pitchCanvas" aria-label="Pitch guide" tabindex="0"></canvas>
+          </div>
+        </div>
+      </div>
 
     </main>
   </div>
@@ -330,11 +337,18 @@ Auto-JP: カラオケが好き"></textarea>
       });
     });
 
-    // Main-pane collapsible sections
-    document.querySelectorAll('details.main-section').forEach(d => {
-      d.addEventListener('toggle', () => {
-        const a = d.querySelector('.section-bar__arrow');
-        if (a) a.style.transform = d.open ? '' : 'rotate(-90deg)';
+    // Main-pane collapsible sections custom logic
+    document.querySelectorAll('.main-section .section-bar--clickable').forEach(bar => {
+      bar.addEventListener('click', (e) => {
+        // Stop toggle if clicking interactive elements inside the bar
+        if (e.target.closest('button, input, select, label, .check-pair')) return;
+        
+        const section = bar.closest('.main-section');
+        if (section) {
+          section.classList.toggle('is-open');
+          // Dispatch a resize event so that ResizeObservers trigger redraws on canvases
+          window.dispatchEvent(new Event('resize'));
+        }
       });
     });
 

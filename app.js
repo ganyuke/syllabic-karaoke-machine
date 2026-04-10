@@ -1386,6 +1386,12 @@ function updateLyricsDynamic() {
 
 function resizeCanvasToDisplaySize(canvas) {
   const rect = canvas.getBoundingClientRect();
+  
+  // If the canvas is collapsed/hidden, skip rendering entirely
+  if (rect.width === 0 || rect.height === 0) {
+    return { ctx: null, width: 0, height: 0, dpr: 1 };
+  }
+
   const dpr = window.devicePixelRatio || 1;
   const width = Math.max(1, Math.round(rect.width * dpr));
   const height = Math.max(1, Math.round(rect.height * dpr));
@@ -1597,6 +1603,8 @@ function drawPlayhead(ctx, width, height, { gutter = 0 } = {}) {
 
 function drawTimeline() {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.timelineCanvas);
+  if (!ctx) return; // Exit if hidden
+  
   drawBackground(ctx, width, height);
   drawTimelineSelectionRange(ctx, width, height);
   drawBeatGrid(ctx, width, height - TIMELINE_TRACK_HEIGHT, { alpha: 0.12 });
@@ -1607,9 +1615,11 @@ function drawTimeline() {
 
 function drawOverview() {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.overviewCanvas);
+  if (!ctx) return; // Exit if hidden
+  
   drawBackground(ctx, width, height);
   const fullDuration = getProjectMaxTime();
-  const peaks = state.waveformPeaks || [];
+  const peaks = state.waveformPeaks ||[];
   if (peaks.length) {
     const mid = height / 2;
     ctx.save();
@@ -1672,6 +1682,8 @@ function getGhostPitchForSelected() {
 
 function drawPitchGuide() {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.pitchCanvas);
+  if (!ctx) return; // Exit if hidden
+
   drawBackground(ctx, width, height);
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);

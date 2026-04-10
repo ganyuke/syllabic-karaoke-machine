@@ -684,25 +684,30 @@ input[type="range"]::-moz-range-thumb {
   background: var(--paper);
 }
 
-/* Static waveform section (not collapsible) */
-.canvas-section {
-  display: flex;
-  flex-direction: column;
-  border-bottom: 1px solid var(--rule);
-  flex-shrink: 0;
-}
-
-/* Collapsible main sections — lyrics + pitch */
+/* Collapsible main sections */
 .main-section {
   display: flex;
   flex-direction: column;
   border-bottom: 1px solid var(--rule);
   flex-shrink: 0;
 }
-/* Pitch roll grows to fill remaining height when open */
-.main-section--flex[open] {
+
+/* Flex sections grow to fill remaining height when open */
+.main-section--flex.is-open {
   flex: 1;
   min-height: 0;
+}
+
+.section-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Hide body when not open */
+.main-section:not(.is-open) .section-body {
+  display: none;
 }
 
 /* Summary row acts as section-bar when clickable */
@@ -721,7 +726,7 @@ input[type="range"]::-moz-range-thumb {
   flex-shrink: 0;
   margin-left: 4px;
 }
-.main-section:not([open]) .section-bar__arrow { transform: rotate(-90deg); }
+.main-section:not(.is-open) .section-bar__arrow { transform: rotate(-90deg); }
 
 .section-bar {
   display: flex;
@@ -769,26 +774,28 @@ input[type="range"]::-moz-range-thumb {
 }
 
 /* Canvas wrappers */
-.canvas-body { overflow: hidden; flex-shrink: 0; }
+.canvas-body {
+  overflow: hidden;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+}
 .timeline-wrap { height: clamp(130px, 25vh, 270px); }
 .overview-wrap { height: 48px; border-top: 1px solid var(--rule); background: var(--paper-1); }
 .pitch-wrap    { flex: 1; min-height: 100px; height: 100%; }
 
-/* Pitch section: make canvas-body fill the details element */
-.main-section--flex[open] > .canvas-body {
+/* Make canvas-body fill the flex element when open */
+.main-section--flex.is-open .canvas-body {
   flex: 1;
   min-height: 0;
-  display: flex;
-  flex-direction: column;
-}
-.main-section--flex[open] > .canvas-body canvas {
-  flex: 1;
 }
 
 canvas {
   display: block;
   width: 100%;
   height: 100%;
+  flex: 1;
+  min-height: 0;
   cursor: crosshair;
   background: var(--canvas-bg);
 }
@@ -797,10 +804,10 @@ canvas {
    LYRICS STAGE
 ════════════════════════════════════════════ */
 .lyrics-stage {
+  flex: 1;
   overflow-y: auto;
   padding: 8px 14px;
-  min-height: 110px;
-  max-height: clamp(110px, 19vh, 210px);
+  min-height: 0;
   background: #fff;
 }
 .lyrics-stage::-webkit-scrollbar { width: 4px; }

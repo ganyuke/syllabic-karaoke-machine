@@ -1,32 +1,19 @@
 # Syllable Karaoke Studio
 
-A local-first browser app for syncing lyrics to audio at syllable granularity.
+A local-first browser app for syncing lyrics to audio, down to the syllable.
 
-## What changed in this version
+## Features
 
-- Explicit **start** and **end** timing per syllable.
-- A denser UI with the important sync controls pinned near the top.
-- `Tap start → next` now always starts from the **currently selected syllable** and moves forward one syllable at a time.
-- Better hotkeys, including **Backspace** for fast correction.
-- A zoomable waveform timeline with a draggable playhead and a draggable overview viewport.
-- A shared time view for the waveform and the pitch roll.
-- A working audible metronome that runs while the song plays.
-- Heuristic **Auto Japanese** splitting for kana and romaji.
-- Toggleable preprocessing exclusions for blank lines and section labels like `[Chorus]`.
-- Draggable pitch blocks in the piano roll, plus a ghost block for the selected syllable when timing exists but pitch is unset.
+- A waveform for scrubbing through and visualizing syllable placement across the song.
+- A karaoke-like visualization of the length of time that a syllable should be drawn out.
+- A pitch roll with user-defined pitches for guiding how each syllable should be sung (with built-in pitch tones).
+- A metronome to get a sense of the timing of a song's vocals.
 
 ## Running it
 
-You can usually open `index.html` directly in a browser, but a tiny local server is more reliable.
+You can open `index.html` in a browser. Or access the version hosted on Github Pages.
 
-```bash
-cd karaoke-lyric-lab
-python3 -m http.server 8000
-```
-
-Then open `http://localhost:8000`.
-
-## Recommended workflow
+## Workflow
 
 1. Load an audio file.
 2. Paste lyrics.
@@ -36,13 +23,13 @@ Then open `http://localhost:8000`.
 4. Click **Build**.
 5. Select the syllable where you want to begin.
 6. Press **Play**.
-7. Use **Tap start → next** while listening.
-8. Use **End @ playhead** when a syllable should stop sounding before the next syllable starts.
+7. Use **Tap → next** while listening to sync a syllable to that instant.
+8. Use **→ end** when a syllable should stop sounding before the next syllable starts.
 9. Fine-tune by dragging the selected timing block in the waveform timeline, dragging its start/end handles, or using the numeric Start/End fields.
 10. Add pitch values in the selected editor or drag note blocks up and down in the pitch roll.
-11. Export the project when you want a portable copy.
+11. Export the project to save it to your disk.
 
-## Important controls
+## Controls
 
 ### Timing
 
@@ -71,7 +58,7 @@ Then open `http://localhost:8000`.
 ## Hotkeys
 
 - `Space`: play / pause
-- `Enter` or `K`: tap selected start and move to next syllable
+- `Enter`, `K`: tap selected start and move to next syllable (you can also use `x`, `z`!)
 - `S`: set selected start at the playhead
 - `E`: set selected end at the playhead
 - `[` or `ArrowLeft`: previous syllable
@@ -107,20 +94,4 @@ This mode uses simple heuristics:
 - `ー` is attached to the preceding kana,
 - romaji are split into Japanese-style chunks like `ko-ko-ro`, `shin-ji-te`, `tto`, `ryo`, `kou`.
 
-It is meant to be practical, not perfect. If the automatic split is not what you want, switch back to manual markup.
-
-## Design choices in this build
-
-- **Single-page, no-build app**: plain HTML/CSS/JS for easy local use and editing.
-- **Explicit syllable ends**: gaps and held notes are now distinct in the data model.
-- **Shared zoom model**: waveform and pitch roll always show the same visible time window.
-- **Heuristic Japanese splitter instead of language-wide NLP**: keeps the app offline and simple.
-- **Lightweight synth guide instead of a sampled soundfont**: avoids external assets while still giving audible pitch reference.
-- **Waveform + overview instead of a full spectrogram**: this keeps the app responsive while still giving practical fine-timing controls.
-
-## Limitations
-
-- The Japanese auto-splitter is heuristic and may need manual correction.
-- The pitch guide is manual; it does not detect sung pitch automatically.
-- The guide synth is a simple Web Audio tone, not a sampled instrument.
-- Exporting with embedded audio can create a large JSON file.
+You can still use manually markup if you so choose in this mode. You cannot currently indicate to keep arbitrary syllables together.
