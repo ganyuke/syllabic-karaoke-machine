@@ -2,7 +2,8 @@ const APP_ID = 'syllable-karaoke-studio';
 const APP_VERSION = 2;
 const DB_NAME = 'syllable-karaoke-studio-db';
 const DB_STORE = 'projects';
-const AUTOSAVE_KEY = 'autosave';
+const AUTOSAVE_STATE_KEY = 'autosave-state';
+const AUTOSAVE_AUDIO_KEY = 'autosave-audio';
 
 const DEMO_LYRICS = `[Verse]
 ka-ra-o-ke ga su-ki
@@ -64,6 +65,8 @@ const defaultState = () => ({
       enabled: false,
       volume: 0.25,
     },
+    followSounding: false,
+    selectWithoutSeek: false,
   },
   selection: {
     syllableId: null,
@@ -111,6 +114,9 @@ const runtime = {
   loadingProject: false,
   drawDirty: true,
   selectedPitchGhost: 60,
+  undoStack: [],
+  snapThreshold: 8, // px distance for snapping
+  artworkObjectUrl: '',
   audioOverlay: {
     metronomeCursorAudioTime: null,
   },
@@ -205,6 +211,9 @@ const els = {
   pitchMaxInput: document.getElementById('pitchMaxInput'),
   pitchCanvas: document.getElementById('pitchCanvas'),
   emptyLyricsTemplate: document.getElementById('emptyLyricsTemplate'),
+  undoBtn: document.getElementById('undoBtn'),
+  followSoundingCheckbox: document.getElementById('followSoundingCheckbox'),
+  selectWithoutSeekCheckbox: document.getElementById('selectWithoutSeekCheckbox'),
 };
 
 function uid(prefix) {
@@ -217,6 +226,39 @@ function deepClone(value) {
     return structuredClone(value);
   }
   return JSON.parse(JSON.stringify(value));
+}
+
+const MAX_UNDO = 60;
+
+function pushUndoSnapshot() {
+  // Store a lightweight snapshot — only structure (timing/pitch data)
+  runtime.undoStack.push(deepClone(state.structure));
+  if (runtime.undoStack.length > MAX_UNDO) {
+    runtime.undoStack.shift();
+  }
+  updateUndoButton();
+}
+
+function performUndo() {
+  if (!runtime.undoStack.length) return;
+  state.structure = runtime.undoStack.pop();
+  rebuildIndex();
+  renderLyrics();
+  updateSelectedEditor();
+  updateSyncStatus();
+  updateLyricsDynamic();
+  markDirty();
+  scheduleAutosave();
+  updateUndoButton();
+}
+
+function updateUndoButton() {
+  if (els.undoBtn) {
+    els.undoBtn.disabled = runtime.undoStack.length === 0;
+    els.undoBtn.title = runtime.undoStack.length > 0
+      ? `Undo (${runtime.undoStack.length} steps, Ctrl+Z)`
+      : 'Nothing to undo';
+  }
 }
 
 function clamp(value, min, max) {
@@ -347,6 +389,8 @@ function mergeStateDefaults(project) {
         ...base.settings.guideSynth,
         ...((incoming.settings && incoming.settings.guideSynth) || {}),
       },
+      followSounding: incoming.settings?.followSounding ?? base.settings.followSounding,
+      selectWithoutSeek: incoming.settings?.selectWithoutSeek ?? base.settings.selectWithoutSeek,
     },
     selection: {
       ...base.selection,
@@ -416,16 +460,15 @@ async function openDb() {
   });
 }
 
-async function putAutosave() {
+async function putAutosaveState() {
   if (runtime.loadingProject) {
     return;
   }
   const db = await openDb();
   const payload = {
-    id: AUTOSAVE_KEY,
+    id: AUTOSAVE_STATE_KEY,
     savedAt: Date.now(),
     project: serializeProject(),
-    audioBlob,
   };
   await new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, 'readwrite');
@@ -437,10 +480,39 @@ async function putAutosave() {
   updateSaveStatus(`Autosaved locally at ${new Date().toLocaleTimeString()}.`);
 }
 
+async function putAutosaveAudio(blob) {
+  const db = await openDb();
+  if (!blob) {
+    // Remove any stale audio record
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, 'readwrite');
+      tx.objectStore(DB_STORE).delete(AUTOSAVE_AUDIO_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    return;
+  }
+  const payload = {
+    id: AUTOSAVE_AUDIO_KEY,
+    savedAt: Date.now(),
+    audioBlob: blob,
+    name: blob.name || '',
+    type: blob.type || 'audio/*',
+  };
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).put(payload);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
 function scheduleAutosave() {
   clearTimeout(runtime.autosaveTimer);
   runtime.autosaveTimer = setTimeout(() => {
-    putAutosave().catch((error) => {
+    putAutosaveState().catch((error) => {
       console.error(error);
       updateSaveStatus('Autosave failed.');
     });
@@ -450,21 +522,61 @@ function scheduleAutosave() {
 async function loadAutosave() {
   try {
     const db = await openDb();
-    const record = await new Promise((resolve, reject) => {
-      const tx = db.transaction(DB_STORE, 'readonly');
-      const request = tx.objectStore(DB_STORE).get(AUTOSAVE_KEY);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    if (!record || !record.project) {
+
+    // Load state and audio records in parallel
+    const [stateRecord, audioRecord] = await Promise.all([
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).get(AUTOSAVE_STATE_KEY);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }),
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const req = tx.objectStore(DB_STORE).get(AUTOSAVE_AUDIO_KEY);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      }),
+    ]);
+
+    if (!stateRecord || !stateRecord.project) {
       updateSaveStatus('No autosaved project yet.');
       return;
     }
-    await hydrateProject(record.project, record.audioBlob || null, { fromAutosave: true });
-    updateSaveStatus(`Loaded autosaved project from ${new Date(record.savedAt).toLocaleString()}.`);
+
+    // Validate audio blob before using it — a partial write from a
+    // mid-flight page unload can leave a blob with size > 0 but
+    // truncated data. Read a small slice to confirm it's intact.
+    let safeAudioBlob = null;
+    if (audioRecord?.audioBlob) {
+      safeAudioBlob = await validateBlob(audioRecord.audioBlob);
+    }
+
+    await hydrateProject(stateRecord.project, safeAudioBlob, { fromAutosave: true });
+    const savedAt = new Date(stateRecord.savedAt).toLocaleString();
+    const audioNote = safeAudioBlob ? '' : audioRecord?.audioBlob ? ' (audio could not be restored)' : '';
+    updateSaveStatus(`Loaded autosaved project from ${savedAt}.${audioNote}`);
   } catch (error) {
     console.error(error);
     updateSaveStatus('Could not access local project storage.');
+  }
+}
+
+/**
+ * Returns the blob if it's readable, or null if it appears corrupted/truncated.
+ * Reads the first and last 4 KB to catch truncated writes.
+ */
+async function validateBlob(blob) {
+  if (!blob || blob.size === 0) return null;
+  try {
+    const checkSize = Math.min(4096, blob.size);
+    // Read start
+    await blob.slice(0, checkSize).arrayBuffer();
+    // Read end (catches truncation)
+    await blob.slice(Math.max(0, blob.size - checkSize)).arrayBuffer();
+    return blob;
+  } catch {
+    return null;
   }
 }
 
@@ -473,7 +585,9 @@ async function clearAutosave() {
     const db = await openDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(DB_STORE, 'readwrite');
-      tx.objectStore(DB_STORE).delete(AUTOSAVE_KEY);
+      const store = tx.objectStore(DB_STORE);
+      store.delete(AUTOSAVE_STATE_KEY);
+      store.delete(AUTOSAVE_AUDIO_KEY);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
       tx.onabort = () => reject(tx.error);
@@ -537,6 +651,11 @@ function computeWaveformPeaks(audioBuffer, samples = 2600) {
 async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
   if (!blob) {
     audioBlob = null;
+    parsedAudioMeta = null;
+    if (runtime.artworkObjectUrl) {
+      URL.revokeObjectURL(runtime.artworkObjectUrl);
+      runtime.artworkObjectUrl = '';
+    }
     state.audioMeta = {
       name: '',
       type: '',
@@ -550,6 +669,10 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
     refreshAudioMeta();
     fitViewToSong();
     resetAudioOverlayState();
+    updateMediaSession();
+    document.title = 'Syllable Karaoke Studio';
+    // Clear the stored audio blob since there's no audio anymore
+    putAutosaveAudio(null).catch(console.error);
     scheduleAutosave();
     return;
   }
@@ -572,6 +695,23 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
 
   refreshAudioMeta();
 
+  // Wait for metadata so duration is available, then restore position
+  if (preservePlaybackPosition && isFiniteNumber(previousTime) && previousTime > 0) {
+    const applySeek = () => {
+      try {
+        const dur = isFiniteNumber(els.audioPlayer.duration) ? els.audioPlayer.duration : (getAudioDuration() || previousTime);
+        els.audioPlayer.currentTime = Math.min(previousTime, dur);
+      } catch (err) {
+        console.warn('Seek after load failed:', err);
+      }
+    };
+    if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
+      applySeek();
+    } else {
+      els.audioPlayer.addEventListener('loadedmetadata', applySeek, { once: true });
+    }
+  }
+
   try {
     const context = await ensureAudioContext(false);
     const arrayBuffer = await blob.arrayBuffer();
@@ -583,18 +723,18 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
     state.waveformPeaks = [];
   }
 
-  if (preservePlaybackPosition && isFiniteNumber(previousTime)) {
-    try {
-      els.audioPlayer.currentTime = Math.min(previousTime, getAudioDuration() || previousTime);
-    } catch (error) {
-      console.warn(error);
-    }
-  }
+  // Parse ID3/metadata tags and expose via Media Session API
+  parseAudioFileMeta(blob).catch(console.warn);
 
   refreshAudioMeta();
   fitViewToSong();
   resetAudioOverlayState();
   markDirty();
+
+  // Save audio blob separately — only on actual audio change, not on every timing edit
+  putAutosaveAudio(blob).catch((error) => {
+    console.error('Audio autosave failed:', error);
+  });
   scheduleAutosave();
 }
 
@@ -1090,7 +1230,7 @@ function updateViewRangeLabel() {
   els.viewRangeLabel.textContent = `${formatClock(runtime.view.start, { hundredths: true })} → ${formatClock(runtime.view.start + runtime.view.duration, { hundredths: true })}`;
 }
 
-function setSelectionSyllableById(id, { practiceKind = 'syllable', practiceId = id, scroll = true, ensureView = true } = {}) {
+function setSelectionSyllableById(id, { practiceKind = 'syllable', practiceId = id, scroll = true, ensureView = true, fromFollowSounding = false } = {}) {
   if (!runtime.index.syllableById.has(id)) {
     return;
   }
@@ -1109,7 +1249,9 @@ function setSelectionSyllableById(id, { practiceKind = 'syllable', practiceId = 
   if (scroll) {
     scrollSelectionIntoView();
   }
-  if (ensureView && entry && isFiniteNumber(entry.syllable.start)) {
+  // "Select without seek" — don't move view or playhead when selecting
+  const noSeek = state.settings.selectWithoutSeek && !fromFollowSounding;
+  if (!noSeek && ensureView && entry && isFiniteNumber(entry.syllable.start)) {
     ensureTimeInView(entry.syllable.start);
   }
   markDirty();
@@ -1187,6 +1329,9 @@ function syncInputsFromState() {
   els.pitchMaxInput.value = String(state.settings.pitchRange.max);
   els.audioPlayer.playbackRate = state.settings.playbackRate;
   els.audioPlayer.volume = state.settings.musicVolume;
+  if (els.followSoundingCheckbox) els.followSoundingCheckbox.checked = state.settings.followSounding ?? false;
+  if (els.selectWithoutSeekCheckbox) els.selectWithoutSeekCheckbox.checked = state.settings.selectWithoutSeek ?? false;
+  updateUndoButton();
   updateLoopButton();
   refreshAudioMeta();
   updateSelectedEditor();
@@ -1231,6 +1376,10 @@ function updateSelectedEditor() {
 }
 
 function buildLyricsStructure() {
+  // Only push undo if we already have timing data worth preserving
+  if (runtime.index.syllables.some(e => isFiniteNumber(e.syllable.start))) {
+    pushUndoSnapshot();
+  }
   state.lyricsMarkup = els.lyricsInput.value;
   state.structure = parseLyricsMarkup(state.lyricsMarkup, state.structure);
   rebuildIndex();
@@ -1357,8 +1506,13 @@ function updateLyricsDynamic() {
     }
     const first = runtime.index.syllableById.get(entry.firstSyllableId);
     const start = first?.syllable.start;
-    node.classList.toggle('selected-word', practiceTarget.kind === 'word' && practiceTarget.id === entry.id);
+    const isSelectedWord = practiceTarget.kind === 'word' && practiceTarget.id === entry.id;
+    // Check if any syllable in this word is selected
+    const hasSelectedSyllable = entry.word.syllables.some(s => s.id === state.selection.syllableId);
+    node.classList.toggle('selected-word', isSelectedWord);
     node.classList.toggle('unsynced', !isFiniteNumber(start));
+    // Lift opacity when word contains the selected syllable (overrides .unsynced fade)
+    node.classList.toggle('has-selected-syllable', hasSelectedSyllable);
   });
 
   runtime.index.lines.forEach((entry) => {
@@ -1381,6 +1535,17 @@ function updateLyricsDynamic() {
       activeLine.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       runtime.lastAutoScrolledLineId = activeLineId;
     }
+  }
+
+  // Follow sounding — keep selection on currently playing syllable
+  if (state.settings.followSounding && soundingEntry && soundingEntry.id !== state.selection.syllableId) {
+    setSelectionSyllableById(soundingEntry.id, {
+      practiceKind: 'syllable',
+      practiceId: soundingEntry.id,
+      scroll: false,
+      ensureView: false,
+      fromFollowSounding: true,
+    });
   }
 }
 
@@ -1587,6 +1752,29 @@ function drawTimelineBlocks(ctx, width, height) {
       ctx.restore();
     }
   });
+
+  // Draw snap-point indicators when dragging a handle
+  if (runtime.drag && (runtime.drag.type === 'start' || runtime.drag.type === 'end')) {
+    const excludeId = runtime.drag.syllableId;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255, 150, 0, 0.7)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    runtime.index.syllables.forEach((entry) => {
+      if (entry.id === excludeId) return;
+      [entry.syllable.start, entry.syllable.end].forEach((t) => {
+        if (!isFiniteNumber(t)) return;
+        if (t < runtime.view.start || t > runtime.view.start + runtime.view.duration) return;
+        const sx = timeToX(t, width);
+        ctx.beginPath();
+        ctx.moveTo(sx, 0);
+        ctx.lineTo(sx, height - TIMELINE_TRACK_HEIGHT);
+        ctx.stroke();
+      });
+    });
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
 }
 
 function drawPlayhead(ctx, width, height, { gutter = 0 } = {}) {
@@ -1786,10 +1974,14 @@ function setSelectedStartTime(time) {
   if (!entry || !isFiniteNumber(time)) {
     return;
   }
-  entry.syllable.start = roundTime(clampSyllableStart(entry.globalIndex, time));
+  pushUndoSnapshot();
+  const newStart = roundTime(clampSyllableStart(entry.globalIndex, time));
+  entry.syllable.start = newStart;
   if (isFiniteNumber(entry.syllable.end) && entry.syllable.end <= entry.syllable.start + EPSILON) {
     entry.syllable.end = null;
   }
+  // If start moved past previous explicit end, clear that previous end
+  resolveOverlapAfterStartMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.start });
 }
 
@@ -1798,7 +1990,10 @@ function setSelectedEndTime(time) {
   if (!entry || !isFiniteNumber(time) || !isFiniteNumber(entry.syllable.start)) {
     return;
   }
+  pushUndoSnapshot();
   entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, time));
+  // If end moved past next start, remove current end and pull next start back
+  resolveOverlapAfterEndMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.end });
 }
 
@@ -1807,10 +2002,12 @@ function setSyllableStartById(id, time) {
   if (!entry || !isFiniteNumber(time)) {
     return;
   }
-  entry.syllable.start = roundTime(clampSyllableStart(entry.globalIndex, time));
+  const newStart = roundTime(clampSyllableStart(entry.globalIndex, time));
+  entry.syllable.start = newStart;
   if (isFiniteNumber(entry.syllable.end) && entry.syllable.end <= entry.syllable.start + EPSILON) {
     entry.syllable.end = null;
   }
+  resolveOverlapAfterStartMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.start, skipSelectionUpdate: true });
 }
 
@@ -1820,7 +2017,45 @@ function setSyllableEndById(id, time) {
     return;
   }
   entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, time));
+  resolveOverlapAfterEndMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.end, skipSelectionUpdate: true });
+}
+
+/**
+ * After moving a syllable's start:
+ * If the start is now >= the previous syllable's explicit end, clear that end
+ * (the previous syllable will use the implicit end = next start).
+ */
+function resolveOverlapAfterStartMove(globalIndex) {
+  if (globalIndex <= 0) return;
+  const entry = runtime.index.syllables[globalIndex];
+  const prev = runtime.index.syllables[globalIndex - 1];
+  if (!entry || !prev) return;
+  if (isFiniteNumber(prev.syllable.end) && isFiniteNumber(entry.syllable.start)) {
+    if (prev.syllable.end > entry.syllable.start) {
+      prev.syllable.end = null;
+    }
+  }
+}
+
+/**
+ * After moving a syllable's end:
+ * If end >= next syllable's start, clear current end and move next start to
+ * just after the drag point (the end becomes implicit via next start).
+ */
+function resolveOverlapAfterEndMove(globalIndex) {
+  const entry = runtime.index.syllables[globalIndex];
+  if (!entry || !isFiniteNumber(entry.syllable.end)) return;
+  for (let i = globalIndex + 1; i < runtime.index.syllables.length; i++) {
+    const next = runtime.index.syllables[i];
+    if (!isFiniteNumber(next.syllable.start)) continue;
+    if (entry.syllable.end > next.syllable.start) {
+      // Move next start to end position, clear current explicit end
+      next.syllable.start = roundTime(entry.syllable.end + EPSILON);
+      entry.syllable.end = null;
+    }
+    break;
+  }
 }
 
 function clearSelectedEnd() {
@@ -1828,6 +2063,7 @@ function clearSelectedEnd() {
   if (!entry) {
     return;
   }
+  pushUndoSnapshot();
   entry.syllable.end = null;
   afterTimingMutation({ ensureViewTime: entry.syllable.start });
 }
@@ -1837,6 +2073,7 @@ function clearSelectedTiming({ movePrev = false } = {}) {
   if (!entry) {
     return;
   }
+  pushUndoSnapshot();
   entry.syllable.start = null;
   entry.syllable.end = null;
   afterTimingMutation();
@@ -1850,6 +2087,7 @@ function clearTimingsFromSelectedForward() {
   if (!entry) {
     return;
   }
+  pushUndoSnapshot();
   for (let i = entry.globalIndex; i < runtime.index.syllables.length; i += 1) {
     runtime.index.syllables[i].syllable.start = null;
     runtime.index.syllables[i].syllable.end = null;
@@ -1862,6 +2100,21 @@ function nudgeSelectedStart(delta) {
   if (!entry || !isFiniteNumber(entry.syllable.start)) {
     return;
   }
+  // Coalesce rapid nudges: only snapshot when the undo stack is empty or last
+  // snapshot's value for this syllable differs meaningfully (>10× nudge step)
+  const coalesceThreshold = Math.abs(delta) * 10;
+  const lastSnap = runtime.undoStack[runtime.undoStack.length - 1];
+  let shouldPush = true;
+  if (lastSnap) {
+    const lastEntry = flattenSyllables(lastSnap).find(e => e.syllable.id === entry.id || e.id === entry.id);
+    // flattenSyllables gives {syllable, id} structure — handle both
+    const lastStart = lastEntry?.syllable?.start ?? lastEntry?.start;
+    if (isFiniteNumber(lastStart) && Math.abs(lastStart - entry.syllable.start) < coalesceThreshold) {
+      shouldPush = false;
+    }
+  }
+  if (shouldPush) pushUndoSnapshot();
+
   entry.syllable.start = roundTime(clampSyllableStart(entry.globalIndex, entry.syllable.start + delta));
   if (isFiniteNumber(entry.syllable.end) && entry.syllable.end <= entry.syllable.start + EPSILON) {
     entry.syllable.end = null;
@@ -1874,12 +2127,17 @@ function setSelectedPitch(value) {
   if (!entry) {
     return;
   }
+  const newPitch = isFiniteNumber(value) ? clamp(Math.round(value), 24, 108) : null;
+  const oldPitch = entry.syllable.pitch;
+  // Only push undo when pitch actually changes (avoids flooding stack on held key)
+  if (newPitch !== oldPitch) {
+    pushUndoSnapshot();
+  }
   if (!isFiniteNumber(value)) {
     entry.syllable.pitch = null;
   } else {
-    const clampedPitch = clamp(Math.round(value), 24, 108);
-    entry.syllable.pitch = clampedPitch;
-    runtime.selectedPitchGhost = clampedPitch;
+    entry.syllable.pitch = newPitch;
+    runtime.selectedPitchGhost = newPitch;
   }
   updateSelectedEditor();
   markDirty();
@@ -1904,6 +2162,7 @@ function applySelectedValuesFromInputs() {
   if (!entry) {
     return;
   }
+  pushUndoSnapshot();
   const rawStart = els.selectedStartInput.value.trim();
   const rawEnd = els.selectedEndInput.value.trim();
   const rawPitch = els.selectedPitchInput.value.trim();
@@ -1956,6 +2215,7 @@ function tapFromSelected() {
   if (!entry) {
     return;
   }
+  // setSelectedStartTime will push undo snapshot
   setSelectedStartTime(getCurrentTime());
   if (entry.globalIndex < runtime.index.syllables.length - 1) {
     selectSyllableByIndex(entry.globalIndex + 1, { scroll: true });
@@ -2245,7 +2505,9 @@ function onLyricsStageClick(event) {
   if (syllableNode) {
     const syllableId = syllableNode.dataset.syllableId;
     setSelectionSyllableById(syllableId, { practiceKind: 'syllable', practiceId: syllableId, scroll: false });
-    jumpToTarget({ kind: 'syllable', id: syllableId }).catch((error) => console.warn(error));
+    if (!state.settings.selectWithoutSeek) {
+      jumpToTarget({ kind: 'syllable', id: syllableId }).catch((error) => console.warn(error));
+    }
     return;
   }
   const wordNode = event.target.closest('.lyric-word');
@@ -2254,7 +2516,9 @@ function onLyricsStageClick(event) {
     const firstSyllableId = runtime.index.wordById.get(wordId)?.firstSyllableId;
     if (firstSyllableId) {
       setSelectionSyllableById(firstSyllableId, { practiceKind: 'word', practiceId: wordId, scroll: false });
-      jumpToTarget({ kind: 'word', id: wordId }).catch((error) => console.warn(error));
+      if (!state.settings.selectWithoutSeek) {
+        jumpToTarget({ kind: 'word', id: wordId }).catch((error) => console.warn(error));
+      }
     }
     return;
   }
@@ -2264,7 +2528,9 @@ function onLyricsStageClick(event) {
     const firstSyllableId = runtime.index.lineById.get(lineId)?.firstSyllableId;
     if (firstSyllableId) {
       setSelectionSyllableById(firstSyllableId, { practiceKind: 'line', practiceId: lineId, scroll: false });
-      jumpToTarget({ kind: 'line', id: lineId }).catch((error) => console.warn(error));
+      if (!state.settings.selectWithoutSeek) {
+        jumpToTarget({ kind: 'line', id: lineId }).catch((error) => console.warn(error));
+      }
     }
   }
 }
@@ -2279,14 +2545,17 @@ function beginTimelineInteraction(event) {
     setSelectionSyllableById(hit.syllableId, { practiceKind: 'syllable', practiceId: hit.syllableId, scroll: false, ensureView: false });
     const entry = runtime.index.syllableById.get(hit.syllableId);
     if (hit.type === 'start-handle') {
+      pushUndoSnapshot();
       runtime.drag = { surface: 'timeline', type: 'start', syllableId: hit.syllableId };
       return;
     }
     if (hit.type === 'end-handle') {
+      pushUndoSnapshot();
       runtime.drag = { surface: 'timeline', type: 'end', syllableId: hit.syllableId };
       return;
     }
     if (selectedEntry?.id === entry.id) {
+      pushUndoSnapshot();
       runtime.drag = {
         surface: 'timeline',
         type: 'move-block',
@@ -2302,22 +2571,43 @@ function beginTimelineInteraction(event) {
   seekToTime(xToTime(point.x, point.width), { play: false }).catch((error) => console.warn(error));
 }
 
+function getSnapTime(rawTime, excludeSyllableId, width) {
+  const snapPx = runtime.snapThreshold;
+  const snapSeconds = (snapPx / Math.max(1, width - 0)) * runtime.view.duration;
+  let best = null;
+  let bestDist = snapSeconds;
+  for (const entry of runtime.index.syllables) {
+    if (entry.id === excludeSyllableId) continue;
+    const candidates = [entry.syllable.start, entry.syllable.end].filter(isFiniteNumber);
+    for (const t of candidates) {
+      const d = Math.abs(t - rawTime);
+      if (d < bestDist) {
+        bestDist = d;
+        best = t;
+      }
+    }
+  }
+  return best !== null ? best : rawTime;
+}
+
 function moveTimelineInteraction(event) {
   if (!runtime.drag || runtime.drag.surface !== 'timeline') {
     return;
   }
   const point = getCanvasPoint(event, els.timelineCanvas);
-  const time = xToTime(point.x, point.width);
+  const rawTime = xToTime(point.x, point.width);
   if (runtime.drag.type === 'scrub') {
-    seekToTime(time, { play: false }).catch((error) => console.warn(error));
+    seekToTime(rawTime, { play: false }).catch((error) => console.warn(error));
     return;
   }
   if (runtime.drag.type === 'start') {
-    setSyllableStartById(runtime.drag.syllableId, time);
+    const snapped = getSnapTime(rawTime, runtime.drag.syllableId, point.width);
+    setSyllableStartById(runtime.drag.syllableId, snapped);
     return;
   }
   if (runtime.drag.type === 'end') {
-    setSyllableEndById(runtime.drag.syllableId, time);
+    const snapped = getSnapTime(rawTime, runtime.drag.syllableId, point.width);
+    setSyllableEndById(runtime.drag.syllableId, snapped);
     return;
   }
   if (runtime.drag.type === 'move-block') {
@@ -2325,7 +2615,7 @@ function moveTimelineInteraction(event) {
     if (!entry || !isFiniteNumber(runtime.drag.startAtDragStart)) {
       return;
     }
-    const delta = time - runtime.drag.originTime;
+    const delta = rawTime - runtime.drag.originTime;
     entry.syllable.start = roundTime(clampSyllableStart(entry.globalIndex, runtime.drag.startAtDragStart + delta));
     if (isFiniteNumber(runtime.drag.endAtDragStart)) {
       entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, runtime.drag.endAtDragStart + delta));
@@ -2499,6 +2789,13 @@ function isEditableTarget(target) {
 function handleKeydown(event) {
   if (isEditableTarget(event.target)) return;
 
+  // Ctrl+Z / Cmd+Z — undo
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+    event.preventDefault();
+    performUndo();
+    return;
+  }
+
   const key = event.key.toLowerCase();
 
   const action = KEY_ACTIONS[key];
@@ -2511,6 +2808,8 @@ function handleKeydown(event) {
 function attachEventListeners() {
   els.projectName.addEventListener('input', () => {
     state.projectName = els.projectName.value;
+    updateMediaSession();
+    updateTitleFromMeta();
     scheduleAutosave();
   });
 
@@ -2551,16 +2850,19 @@ function attachEventListeners() {
   els.audioPlayer.addEventListener('ended', () => {
     stopGuideVoice();
     updateTransportUi();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
   });
 
   els.audioPlayer.addEventListener('play', () => {
     ensureAudioContext(true).catch((error) => console.warn(error));
     resetAudioOverlayState();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
   });
 
   els.audioPlayer.addEventListener('pause', () => {
     resetAudioOverlayState();
     stopGuideVoice();
+    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
   });
 
   els.playPauseBtn.addEventListener('click', () => togglePlayPause().catch((error) => console.warn(error)));
@@ -2746,6 +3048,27 @@ function attachEventListeners() {
   els.pitchCanvas.addEventListener('wheel', onViewWheel, { passive: false });
   window.addEventListener('keydown', handleKeydown);
 
+  // Undo button
+  if (els.undoBtn) {
+    els.undoBtn.addEventListener('click', () => performUndo());
+  }
+
+  // Follow sounding checkbox
+  if (els.followSoundingCheckbox) {
+    els.followSoundingCheckbox.addEventListener('change', () => {
+      state.settings.followSounding = els.followSoundingCheckbox.checked;
+      scheduleAutosave();
+    });
+  }
+
+  // Select without seek checkbox
+  if (els.selectWithoutSeekCheckbox) {
+    els.selectWithoutSeekCheckbox.addEventListener('change', () => {
+      state.settings.selectWithoutSeek = els.selectWithoutSeekCheckbox.checked;
+      scheduleAutosave();
+    });
+  }
+
   runtime.resizeObserver = new ResizeObserver(() => {
     markDirty();
   });
@@ -2754,12 +3077,153 @@ function attachEventListeners() {
   runtime.resizeObserver.observe(els.pitchCanvas);
 }
 
+// ════════════════════════════════════════════
+// MEDIA SESSION API + ID3 METADATA
+// ════════════════════════════════════════════
+
+// Cached parsed metadata from the audio file
+let parsedAudioMeta = null;
+
+async function parseAudioFileMeta(blob) {
+  parsedAudioMeta = null;
+  if (!blob) return;
+
+  // Try jsmediatags (loaded via CDN on demand)
+  try {
+    await ensureJsMediaTags();
+    parsedAudioMeta = await new Promise((resolve) => {
+      window.jsmediatags.read(blob, {
+        onSuccess: (tag) => resolve(tag.tags || {}),
+        onError: () => resolve({}),
+      });
+    });
+  } catch {
+    parsedAudioMeta = {};
+  }
+
+  updateMediaSession();
+  updateTitleFromMeta();
+}
+
+function ensureJsMediaTags() {
+  if (window.jsmediatags) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/jsmediatags/3.9.5/jsmediatags.min.js';
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+}
+
+function getMetaTitle() {
+  const t = parsedAudioMeta?.title;
+  if (t) return t;
+  // Fall back to projectName or audio filename (strip extension)
+  return state.projectName || (state.audioMeta.name || '').replace(/\.[^.]+$/, '') || 'Karaoke project';
+}
+
+function getMetaArtist() {
+  return parsedAudioMeta?.artist || parsedAudioMeta?.TPE1 || '';
+}
+
+function getMetaAlbum() {
+  return parsedAudioMeta?.album || '';
+}
+
+function getMetaArtworkUrl() {
+  const pic = parsedAudioMeta?.picture;
+  if (!pic || !pic.data) return null;
+  try {
+    const bytes = new Uint8Array(pic.data);
+    const blob = new Blob([bytes], { type: pic.format || 'image/jpeg' });
+    if (runtime.artworkObjectUrl) URL.revokeObjectURL(runtime.artworkObjectUrl);
+    runtime.artworkObjectUrl = URL.createObjectURL(blob);
+    return runtime.artworkObjectUrl;
+  } catch {
+    return null;
+  }
+}
+
+function updateMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+
+  const artworkUrl = getMetaArtworkUrl();
+  const artwork = artworkUrl
+    ? [{ src: artworkUrl, sizes: '512x512', type: 'image/jpeg' }]
+    : [];
+
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: getMetaTitle(),
+    artist: getMetaArtist(),
+    album: getMetaAlbum(),
+    artwork,
+  });
+
+  const duration = getAudioDuration();
+
+  navigator.mediaSession.setActionHandler('play', () => {
+    ensureAudioContext(true).then(() => els.audioPlayer.play()).catch(console.warn);
+  });
+  navigator.mediaSession.setActionHandler('pause', () => {
+    els.audioPlayer.pause();
+  });
+  navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+    const step = details.seekOffset ?? state.settings.seekStep;
+    seekToTime(getCurrentTime() - step, { play: null }).catch(console.warn);
+  });
+  navigator.mediaSession.setActionHandler('seekforward', (details) => {
+    const step = details.seekOffset ?? state.settings.seekStep;
+    seekToTime(getCurrentTime() + step, { play: null }).catch(console.warn);
+  });
+  navigator.mediaSession.setActionHandler('seekto', (details) => {
+    if (details.fastSeek && 'fastSeek' in els.audioPlayer) {
+      els.audioPlayer.fastSeek(details.seekTime);
+    } else {
+      seekToTime(details.seekTime, { play: null }).catch(console.warn);
+    }
+  });
+  navigator.mediaSession.setActionHandler('previoustrack', () => {
+    seekToTime(0, { play: null }).catch(console.warn);
+  });
+  navigator.mediaSession.setActionHandler('nexttrack', null);
+}
+
+function updateMediaSessionPosition() {
+  if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
+  const duration = getAudioDuration();
+  if (!duration || !isFiniteNumber(duration) || duration <= 0) return;
+  try {
+    navigator.mediaSession.setPositionState({
+      duration,
+      playbackRate: state.settings.playbackRate,
+      position: clamp(getCurrentTime(), 0, duration),
+    });
+  } catch {
+    // setPositionState throws if duration isn't ready yet — ignore
+  }
+}
+
+function updateTitleFromMeta() {
+  // Auto-fill project name from ID3 if still blank
+  if (!state.projectName && parsedAudioMeta?.title) {
+    const parts = [parsedAudioMeta.artist, parsedAudioMeta.title].filter(Boolean);
+    state.projectName = parts.join(' — ');
+    els.projectName.value = state.projectName;
+    scheduleAutosave();
+  }
+  // Update browser tab title
+  const name = getMetaTitle();
+  document.title = name ? `${name} · Syllable KS` : 'Syllable Karaoke Studio';
+}
+
 function animate() {
   applyLooping();
   scheduleMetronomeClicks();
   updateGuideVoice();
   updateTransportUi();
   updateLyricsDynamic();
+  updateMediaSessionPosition();
   if (runtime.drawDirty || !els.audioPlayer.paused || runtime.drag) {
     drawTimeline();
     drawOverview();
@@ -2778,6 +3242,9 @@ async function init() {
   await loadAutosave();
   updateTransportUi();
   setFocusRegion('timing');
+  updateMediaSession();
+  updateTitleFromMeta();
+  updateUndoButton();
   markDirty();
   requestAnimationFrame(animate);
 }

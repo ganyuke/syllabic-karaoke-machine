@@ -901,10 +901,6 @@ canvas {
   border: 1px solid transparent;
   transition: border-color 0.12s, box-shadow 0.12s;
 }
-.syllable.is-selected::after {
-  border-color: var(--amber);
-  box-shadow: 0 0 0 2px var(--amber-light);
-}
 .syllable.is-sounding::after {
   border-color: var(--indigo);
   box-shadow: 0 0 0 2px var(--indigo-light);
@@ -914,6 +910,12 @@ canvas {
 .syllable.is-unsynced::after {
   border-color: var(--rule);
   border-style: dashed;
+}
+
+/* placement matters here to override alpha border color for .is-unsynced */
+.syllable.is-selected::after {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 2px var(--amber-light);
 }
 
 .syllable-joiner {
@@ -978,4 +980,91 @@ canvas {
 @media (max-width: 520px) {
   .topbar-mid { flex-wrap: wrap; }
   .brand-serif { font-size: 15px; }
+}
+/* ════════════════════════════════════════════
+   ADDITIONS & OVERRIDES
+════════════════════════════════════════════ */
+
+/* Check pair row — side-by-side checkboxes */
+.check-pair-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+}
+
+/* Extras group in transport — can wrap */
+.t-group--extras {
+  flex-wrap: wrap;
+}
+
+/* ── Responsive topbar ── */
+@media (max-width: 900px) {
+  .topbar {
+    height: auto;
+    flex-wrap: wrap;
+    padding: 6px 12px;
+    gap: 6px;
+  }
+  .topbar-mid {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .topbar-actions {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .topbar-status {
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+  .save-status {
+    font-size: 10px;
+  }
+  .project-field input {
+    width: 120px;
+  }
+}
+
+@media (max-width: 680px) {
+  .brand-serif { font-size: 14px; }
+  .tag--file { max-width: 110px; }
+}
+
+/* ── Responsive transport ── */
+@media (max-width: 900px) {
+  .transport {
+    height: auto;
+    flex-wrap: wrap;
+    padding: 6px 10px;
+    gap: 4px 6px;
+  }
+  .t-div { display: none; }
+  .t-group { flex-wrap: wrap; }
+  .t-scrub { min-width: 100%; order: 99; }
+}
+
+/* ── Selected syllable: override faded unsynced when selected ── */
+.lyric-word.unsynced .syllable.is-selected,
+.lyric-word.unsynced:has(.syllable.is-selected) {
+  opacity: 1;
+}
+/* Make word container not fade when it contains the selected syllable */
+.lyric-word.unsynced:has(.syllable.is-selected) {
+  opacity: 1;
+}
+
+/* is-selected always wins over is-sounding visually */
+.syllable.is-selected.is-sounding::after {
+  border-color: var(--amber) !important;
+  box-shadow: 0 0 0 2px var(--amber-light) !important;
+}
+
+/* Snap indicator on timeline blocks */
+.snap-active canvas {
+  cursor: ew-resize;
+}
+
+/* Word that contains the currently selected syllable — override unsynced fade */
+.lyric-word.unsynced.has-selected-syllable {
+  opacity: 1;
 }

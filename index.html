@@ -66,7 +66,8 @@
       <button id="loopSelectionBtn"   class="btn btn-ghost btn-sm" title="Toggle loop on selection">Loop off</button>
     </div>
     <div class="t-div"></div>
-    <div class="t-group">
+    <div class="t-group t-group--extras">
+      <button id="undoBtn"                class="btn btn-ghost btn-sm" title="Undo (Ctrl+Z)">Undo</button>
       <button id="clearSelectedTimeBtn"   class="btn btn-ghost btn-sm btn-red-hover" title="Clear timing (Delete)">Clear timing</button>
       <button id="clearFollowingTimesBtn" class="btn btn-ghost btn-sm btn-red-hover" title="Clear from here forward (Shift+Backspace)">Clear → end</button>
       <button id="clearSelectedPitchBtn"  class="btn btn-ghost btn-sm btn-red-hover" title="Clear pitch (Backspace in pitch mode)">Clear pitch</button>
@@ -157,7 +158,17 @@ Auto-JP: カラオケが好き"></textarea>
             <button id="nudgeForwardBtn"      class="btn btn-ghost btn-xs">+1×</button>
             <button id="nudgeForwardLargeBtn" class="btn btn-ghost btn-xs">+4×</button>
           </div>
-          <p class="hint">Space play · Enter/K tap→next · S/E set · ↑↓ pitch · J/L seek · Backspace clear</p>
+          <div class="check-pair-row">
+            <label class="check-pair" title="Selection always follows the sounding syllable">
+              <input id="followSoundingCheckbox" type="checkbox" />
+              <span>Follow sounding</span>
+            </label>
+            <label class="check-pair" title="Selecting a syllable does not move the playhead">
+              <input id="selectWithoutSeekCheckbox" type="checkbox" />
+              <span>Select without seek</span>
+            </label>
+          </div>
+          <p class="hint">Space play · Enter/K tap→next · S/E set · ↑↓ pitch · J/L seek · Backspace clear · Ctrl+Z undo</p>
         </div>
       </details>
 
@@ -249,11 +260,11 @@ Auto-JP: カラオケが好き"></textarea>
 
     <main class="mainpane">
 
-      <!-- WAVEFORM — collapsible manually managed div structure -->
+      <!-- WAVEFORM -->
       <div class="main-section is-open">
         <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Waveform</span>
-          <div class="section-bar__right" onclick="event.stopPropagation()">
+          <div class="section-bar__right">
             <button id="zoomOutBtn"      class="btn btn-ghost btn-xs">−</button>
             <button id="zoomInBtn"       class="btn btn-ghost btn-xs">+</button>
             <button id="fitSongBtn"      class="btn btn-ghost btn-xs">Fit song</button>
@@ -272,11 +283,11 @@ Auto-JP: カラオケが好き"></textarea>
         </div>
       </div>
 
-      <!-- LYRICS — collapsible manually managed div structure -->
+      <!-- LYRICS -->
       <div class="main-section main-section--flex is-open">
         <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Lyrics</span>
-          <div class="section-bar__right" onclick="event.stopPropagation()">
+          <div class="section-bar__right">
             <span id="syncStatusPill" class="tag tag--sync">0 / 0 starts</span>
             <span class="legend selected-legend">selected</span>
             <span class="legend sounding-legend">sounding</span>
@@ -289,11 +300,11 @@ Auto-JP: カラオケが好き"></textarea>
         </div>
       </div>
 
-      <!-- PITCH ROLL — collapsible manually managed div structure -->
+      <!-- PITCH ROLL -->
       <div class="main-section main-section--flex is-open">
         <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Pitch roll</span>
-          <div class="section-bar__right" onclick="event.stopPropagation()">
+          <div class="section-bar__right">
             <label class="check-pair" title="Play guide synth">
               <input id="guideSynthEnabled" type="checkbox" />
               <span>Guide synth</span>
@@ -329,24 +340,28 @@ Auto-JP: カラオケが好き"></textarea>
 
   <script src="app.js" defer></script>
   <script>
-    // Sidebar panels
+    // Sidebar panels — whole label toggles except interactive children
     document.querySelectorAll('details.panel').forEach(d => {
       d.addEventListener('toggle', () => {
         const a = d.querySelector('.panel__arrow');
         if (a) a.style.transform = d.open ? '' : 'rotate(-90deg)';
       });
+      const summary = d.querySelector('summary.panel__hd');
+      if (!summary) return;
+      summary.addEventListener('click', (e) => {
+        if (e.target.closest('button, input, select, a, .panel__hd-right')) {
+          e.preventDefault();
+        }
+      });
     });
 
-    // Main-pane collapsible sections custom logic
+    // Main-pane collapsible sections
     document.querySelectorAll('.main-section .section-bar--clickable').forEach(bar => {
       bar.addEventListener('click', (e) => {
-        // Stop toggle if clicking interactive elements inside the bar
         if (e.target.closest('button, input, select, label, .check-pair')) return;
-        
         const section = bar.closest('.main-section');
         if (section) {
           section.classList.toggle('is-open');
-          // Dispatch a resize event so that ResizeObservers trigger redraws on canvases
           window.dispatchEvent(new Event('resize'));
         }
       });
