@@ -117,6 +117,7 @@ const runtime = {
   undoStack: [],
   snapThreshold: 8, // px distance for snapping
   artworkObjectUrl: '',
+  lastFollowSoundingId: null, // tracks last syllable follow-sounding snapped to
   audioOverlay: {
     metronomeCursorAudioTime: null,
   },
@@ -1537,15 +1538,28 @@ function updateLyricsDynamic() {
     }
   }
 
-  // Follow sounding — keep selection on currently playing syllable
-  if (state.settings.followSounding && soundingEntry && soundingEntry.id !== state.selection.syllableId) {
-    setSelectionSyllableById(soundingEntry.id, {
-      practiceKind: 'syllable',
-      practiceId: soundingEntry.id,
-      scroll: false,
-      ensureView: false,
-      fromFollowSounding: true,
-    });
+  // Follow sounding — only snap selection when:
+  //   (1) playback is running AND
+  //   (2) the sounding syllable has actually changed since we last snapped
+  // This lets the user freely move the selector with [ ] while paused,
+  // and also while playing as long as the sounding syllable stays the same.
+  if (state.settings.followSounding) {
+    if (!els.audioPlayer.paused && soundingEntry && soundingEntry.id !== runtime.lastFollowSoundingId) {
+      runtime.lastFollowSoundingId = soundingEntry.id;
+      if (soundingEntry.id !== state.selection.syllableId) {
+        setSelectionSyllableById(soundingEntry.id, {
+          practiceKind: 'syllable',
+          practiceId: soundingEntry.id,
+          scroll: false,
+          ensureView: false,
+          fromFollowSounding: true,
+        });
+      }
+    } else if (els.audioPlayer.paused) {
+      // While paused, reset the tracker so that when playback resumes
+      // the next sounding syllable (even if same as before) triggers a snap.
+      runtime.lastFollowSoundingId = null;
+    }
   }
 }
 
@@ -3057,6 +3071,8 @@ function attachEventListeners() {
   if (els.followSoundingCheckbox) {
     els.followSoundingCheckbox.addEventListener('change', () => {
       state.settings.followSounding = els.followSoundingCheckbox.checked;
+      // Reset tracker so enabling mid-playback immediately snaps to sounding syllable
+      runtime.lastFollowSoundingId = null;
       scheduleAutosave();
     });
   }
