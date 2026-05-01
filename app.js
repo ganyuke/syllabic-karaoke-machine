@@ -121,6 +121,13 @@ const runtime = {
   audioOverlay: {
     metronomeCursorAudioTime: null,
   },
+  edgeScroll: {
+    active: false,
+    pointerX: 0,
+    width: 0,
+    gutter: 0,
+    lastTs: 0,
+  },
   lastAutoScrolledLineId: null,
 };
 
@@ -1227,6 +1234,19 @@ function panViewTo(start) {
   markDirty();
 }
 
+function setPlayheadTimeImmediate(time) {
+  const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
+  try {
+    els.audioPlayer.currentTime = clampedTime;
+  } catch (error) {
+    console.warn(error);
+  }
+  resetAudioOverlayState();
+  updateTransportUi();
+  updateLyricsDynamic();
+  markDirty();
+}
+
 function updateViewRangeLabel() {
   els.viewRangeLabel.textContent = `${formatClock(runtime.view.start, { hundredths: true })} → ${formatClock(runtime.view.start + runtime.view.duration, { hundredths: true })}`;
 }
@@ -1710,8 +1730,8 @@ function drawTimelineBlocks(ctx, width, height) {
     const isSelected = selected?.id === entry.id;
     const isSounding = getCurrentSoundingEntry()?.id === entry.id;
     ctx.save();
-    ctx.fillStyle = isSounding ? 'rgba(210, 90, 20, 0.88)' : isSelected ? 'rgba(30, 90, 200, 0.82)' : 'rgba(20, 160, 100, 0.55)';
-    ctx.strokeStyle = isSelected ? 'rgba(10, 50, 160, 0.9)' : 'rgba(0,0,0,0.12)';
+    ctx.fillStyle = isSelected ? 'rgba(214, 160, 34, 0.88)' : isSounding ? 'rgba(43, 74, 203, 0.82)' : 'rgba(20, 160, 100, 0.55)';
+    ctx.strokeStyle = isSelected ? 'rgba(158, 108, 8, 0.92)' : isSounding ? 'rgba(25, 52, 153, 0.9)' : 'rgba(0,0,0,0.12)';
     ctx.lineWidth = isSelected ? 1.8 : 1;
     roundRect(ctx, x1, y, w, trackHeight, 7);
     ctx.fill();
@@ -1760,7 +1780,7 @@ function drawTimelineBlocks(ctx, width, height) {
         h: trackHeight,
       });
       ctx.save();
-      ctx.fillStyle = 'rgba(10, 50, 180, 0.95)';
+      ctx.fillStyle = 'rgba(158, 108, 8, 0.95)';
       ctx.fillRect(x1 - 1, y - 1, 2, trackHeight + 2);
       ctx.fillRect(x2 - 1, y - 1, 2, trackHeight + 2);
       ctx.restore();
@@ -1928,12 +1948,18 @@ function drawPitchGuide() {
     ctx.save();
     ctx.fillStyle = shouldShowGhost
       ? 'rgba(0,0,0,0.08)'
-      : isSounding
-        ? 'rgba(210, 90, 20, 0.88)'
-        : isSelected
-          ? 'rgba(30, 90, 200, 0.85)'
+      : isSelected
+        ? 'rgba(214, 160, 34, 0.88)'
+        : isSounding
+          ? 'rgba(43, 74, 203, 0.85)'
           : 'rgba(20, 160, 100, 0.65)';
-    ctx.strokeStyle = shouldShowGhost ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.7)';
+    ctx.strokeStyle = shouldShowGhost
+      ? 'rgba(0,0,0,0.5)'
+      : isSelected
+        ? 'rgba(158, 108, 8, 0.92)'
+        : isSounding
+          ? 'rgba(25, 52, 153, 0.9)'
+          : 'rgba(255,255,255,0.7)';
     ctx.lineWidth = shouldShowGhost ? 1.8 : 1;
     if (shouldShowGhost) {
       ctx.setLineDash([6, 4]);
@@ -2237,16 +2263,7 @@ function tapFromSelected() {
 }
 
 async function seekToTime(time, { play = null } = {}) {
-  const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
-  try {
-    els.audioPlayer.currentTime = clampedTime;
-  } catch (error) {
-    console.warn(error);
-  }
-  resetAudioOverlayState();
-  updateTransportUi();
-  updateLyricsDynamic();
-  markDirty();
+  setPlayheadTimeImmediate(time);
   if (play === true) {
     await ensureAudioContext(true);
     try {
@@ -2582,7 +2599,8 @@ function beginTimelineInteraction(event) {
     }
   }
   runtime.drag = { surface: 'timeline', type: 'scrub' };
-  seekToTime(xToTime(point.x, point.width), { play: false }).catch((error) => console.warn(error));
+  updateEdgeScrollState(point, 0);
+  setPlayheadTimeImmediate(xToTime(point.x, point.width));
 }
 
 function getSnapTime(rawTime, excludeSyllableId, width) {
@@ -2611,7 +2629,8 @@ function moveTimelineInteraction(event) {
   const point = getCanvasPoint(event, els.timelineCanvas);
   const rawTime = xToTime(point.x, point.width);
   if (runtime.drag.type === 'scrub') {
-    seekToTime(rawTime, { play: false }).catch((error) => console.warn(error));
+    updateEdgeScrollState(point, 0);
+    setPlayheadTimeImmediate(rawTime);
     return;
   }
   if (runtime.drag.type === 'start') {
@@ -2641,6 +2660,7 @@ function moveTimelineInteraction(event) {
 function endTimelineInteraction() {
   if (runtime.drag?.surface === 'timeline') {
     runtime.drag = null;
+    runtime.edgeScroll.active = false;
     scheduleAutosave();
   }
 }
@@ -2702,7 +2722,8 @@ function beginPitchInteraction(event) {
     return;
   }
   runtime.drag = { surface: 'pitch', type: 'scrub' };
-  seekToTime(xToTime(point.x, point.width, PITCH_GUTTER), { play: false }).catch((error) => console.warn(error));
+  updateEdgeScrollState(point, PITCH_GUTTER);
+  setPlayheadTimeImmediate(xToTime(point.x, point.width, PITCH_GUTTER));
 }
 
 function movePitchInteraction(event) {
@@ -2711,7 +2732,8 @@ function movePitchInteraction(event) {
   }
   const point = getCanvasPoint(event, els.pitchCanvas);
   if (runtime.drag.type === 'scrub') {
-    seekToTime(xToTime(point.x, point.width, PITCH_GUTTER), { play: false }).catch((error) => console.warn(error));
+    updateEdgeScrollState(point, PITCH_GUTTER);
+    setPlayheadTimeImmediate(xToTime(point.x, point.width, PITCH_GUTTER));
     return;
   }
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
@@ -2723,7 +2745,60 @@ function movePitchInteraction(event) {
 function endPitchInteraction() {
   if (runtime.drag?.surface === 'pitch') {
     runtime.drag = null;
+    runtime.edgeScroll.active = false;
     scheduleAutosave();
+  }
+}
+
+function updateEdgeScrollState(point, gutter = 0) {
+  runtime.edgeScroll.active = runtime.view.duration < Math.max(FULL_VIEW_MIN, getProjectMaxTime());
+  runtime.edgeScroll.pointerX = point.x;
+  runtime.edgeScroll.width = point.width;
+  runtime.edgeScroll.gutter = gutter;
+  if (!runtime.edgeScroll.active) {
+    runtime.edgeScroll.lastTs = 0;
+  }
+}
+
+function applyEdgeScroll(ts) {
+  if (!runtime.drag || runtime.drag.type !== 'scrub' || !runtime.edgeScroll.active) {
+    runtime.edgeScroll.lastTs = ts;
+    return;
+  }
+
+  const { pointerX, width, gutter } = runtime.edgeScroll;
+  const usableWidth = Math.max(1, width - gutter);
+  const localX = pointerX - gutter;
+  const edgeZone = Math.max(24, Math.min(usableWidth * 0.12, 72 * (window.devicePixelRatio || 1)));
+
+  let direction = 0;
+  let intensity = 0;
+  if (localX < edgeZone) {
+    direction = -1;
+    intensity = (edgeZone - localX) / edgeZone;
+  } else if (localX > usableWidth - edgeZone) {
+    direction = 1;
+    intensity = (localX - (usableWidth - edgeZone)) / edgeZone;
+  }
+
+  if (!direction || intensity <= 0) {
+    runtime.edgeScroll.lastTs = ts;
+    return;
+  }
+
+  const dt = runtime.edgeScroll.lastTs ? Math.min(64, ts - runtime.edgeScroll.lastTs) / 1000 : 0;
+  runtime.edgeScroll.lastTs = ts;
+  if (dt <= 0) {
+    return;
+  }
+
+  const secondsPerSecond = runtime.view.duration * (0.45 + Math.pow(Math.min(1.4, intensity), 1.6) * 4.5);
+  const previousStart = runtime.view.start;
+  panViewTo(previousStart + direction * secondsPerSecond * dt);
+
+  if (runtime.view.start !== previousStart) {
+    const clampedX = clamp(pointerX, gutter, width);
+    setPlayheadTimeImmediate(xToTime(clampedX, width, gutter));
   }
 }
 
@@ -2732,9 +2807,18 @@ function onViewWheel(event) {
   const canvas = event.currentTarget;
   const point = getCanvasPoint(event, canvas);
   const gutter = canvas === els.pitchCanvas ? PITCH_GUTTER : 0;
-  const anchorTime = xToTime(point.x, point.width, gutter);
-  const factor = event.deltaY < 0 ? 0.8 : 1.25;
-  zoomView(factor, anchorTime);
+  const usableWidth = Math.max(1, point.width - gutter);
+
+  if (event.deltaX) {
+    const panSeconds = (event.deltaX / usableWidth) * runtime.view.duration;
+    panViewTo(runtime.view.start + panSeconds);
+  }
+
+  if (event.deltaY) {
+    const anchorTime = xToTime(point.x, point.width, gutter);
+    const factor = event.deltaY < 0 ? 0.8 : 1.25;
+    zoomView(factor, anchorTime);
+  }
 }
 
 async function togglePlayPause() {
@@ -2765,6 +2849,18 @@ const nudgeEnd = (e, s) => nudgeSelectedStart(s.settings.nudgeStep)
 const deleteTiming = (e, s) => clearSelectedTiming({ movePrev: false })
 const selectBack = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) - 1, { scroll: true })
 const selectFoward = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) + 1, { scroll: true })
+const selectSounding = () => {
+  const soundingEntry = getCurrentSoundingEntry();
+  if (soundingEntry) {
+    setSelectionSyllableById(soundingEntry.id, { scroll: true, ensureView: true });
+  }
+}
+const jumpToSelectedStart = (e, s) => {
+  const entry = getSelectionEntry();
+  if (!entry || !isFiniteNumber(entry.syllable.start)) return;
+  ensureTimeInView(entry.syllable.start);
+  seekToTime(entry.syllable.start, { play: s.settings.autoPlayOnJump }).catch(console.warn);
+}
 const backspaceHandler = (e, s) => {
   if (s.focusRegion === 'pitch') return clearSelectedPitch();
   if (e.shiftKey) return clearTimingsFromSelectedForward();
@@ -2787,6 +2883,8 @@ const KEY_ACTIONS = {
   '.': nudgeEnd,
   'delete': deleteTiming,
   'backspace': backspaceHandler,
+  'a': selectSounding,
+  'g': jumpToSelectedStart,
   'arrowup': pitchUp,
   'arrowdown': pitchDown,
   '[': selectBack,
@@ -3233,7 +3331,8 @@ function updateTitleFromMeta() {
   document.title = name ? `${name} · Syllable KS` : 'Syllable Karaoke Studio';
 }
 
-function animate() {
+function animate(ts) {
+  applyEdgeScroll(ts);
   applyLooping();
   scheduleMetronomeClicks();
   updateGuideVoice();
