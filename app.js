@@ -44,6 +44,7 @@ const defaultState = () => ({
     musicVolume: 1,
     autoPlayOnJump: true,
     autoScrollLyrics: true,
+    autoScrollWindow: false,
     loopSelection: false,
     preprocessing: {
       splitMode: 'manual',
@@ -121,7 +122,24 @@ const runtime = {
   audioOverlay: {
     metronomeCursorAudioTime: null,
   },
+  edgeScroll: {
+    active: false,
+    pointerX: 0,
+    width: 0,
+    gutter: 0,
+    lastTs: 0,
+  },
   lastAutoScrolledLineId: null,
+  renderCache: {
+    fontFamily: '',
+    timelineBase: { canvas: null, key: '' },
+    overviewBase: { canvas: null, key: '' },
+    pitchBase: { canvas: null, key: '' },
+    timelineWaveformTiles: { key: '', entries: new Map() },
+    timelineWaveformLevels: { key: '', levels: null },
+    waveformVersion: 0,
+  },
+  lastDrawnTime: null,
 };
 
 const els = {
@@ -164,6 +182,7 @@ const els = {
   guideVolumeLabel: document.getElementById('guideVolumeLabel'),
   autoPlayOnJump: document.getElementById('autoPlayOnJump'),
   autoScrollLyrics: document.getElementById('autoScrollLyrics'),
+  autoScrollWindow: document.getElementById('autoScrollWindow'),
   selectedSummary: document.getElementById('selectedSummary'),
   currentTimeLabel: document.getElementById('currentTimeLabel'),
   scrubInput: document.getElementById('scrubInput'),
@@ -337,6 +356,37 @@ function markDirty() {
   runtime.drawDirty = true;
 }
 
+function getUiFontFamily() {
+  if (!runtime.renderCache.fontFamily) {
+    runtime.renderCache.fontFamily = getComputedStyle(document.body).fontFamily;
+  }
+  return runtime.renderCache.fontFamily;
+}
+
+function invalidateRenderCaches(...keys) {
+  if (!keys.length || keys.includes('timeline')) {
+    runtime.renderCache.timelineBase.key = '';
+    runtime.renderCache.timelineWaveformTiles.key = '';
+    runtime.renderCache.timelineWaveformTiles.entries = new Map();
+  }
+  if (!keys.length || keys.includes('overview')) {
+    runtime.renderCache.overviewBase.key = '';
+  }
+  if (!keys.length || keys.includes('pitch')) {
+    runtime.renderCache.pitchBase.key = '';
+  }
+  runtime.drawDirty = true;
+}
+
+function createRenderBuffer(width, height, existingCanvas = null) {
+  const canvas = existingCanvas || document.createElement('canvas');
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return canvas;
+}
+
 function getAudioDuration() {
   if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
     return els.audioPlayer.duration;
@@ -392,6 +442,7 @@ function mergeStateDefaults(project) {
       },
       followSounding: incoming.settings?.followSounding ?? base.settings.followSounding,
       selectWithoutSeek: incoming.settings?.selectWithoutSeek ?? base.settings.selectWithoutSeek,
+      autoScrollWindow: incoming.settings?.autoScrollWindow ?? base.settings.autoScrollWindow,
     },
     selection: {
       ...base.selection,
@@ -429,6 +480,10 @@ function serializeProject() {
     appId: APP_ID,
     version: APP_VERSION,
     updatedAt: new Date().toISOString(),
+    playback: {
+      currentTime: getCurrentTime(),
+      wasPlaying: !els.audioPlayer.paused,
+    },
     project: deepClone(state),
   };
 }
@@ -545,12 +600,23 @@ async function loadAutosave() {
       return;
     }
 
-    // Validate audio blob before using it — a partial write from a
-    // mid-flight page unload can leave a blob with size > 0 but
-    // truncated data. Read a small slice to confirm it's intact.
+    // Firefox can return a Blob from IndexedDB that is technically readable
+    // but still flaky when used directly as media src. Materialize the full
+    // byte payload into a fresh Blob/File before handing it to <audio>.
     let safeAudioBlob = null;
     if (audioRecord?.audioBlob) {
       safeAudioBlob = await validateBlob(audioRecord.audioBlob);
+      const expectedSize = Number(stateRecord.project?.project?.audioMeta?.size || stateRecord.project?.audioMeta?.size || 0);
+      if (safeAudioBlob && expectedSize > 0 && safeAudioBlob.size !== expectedSize) {
+        console.warn('Ignoring autosaved audio blob with unexpected size.', { expectedSize, actualSize: safeAudioBlob.size });
+        safeAudioBlob = null;
+      }
+      if (safeAudioBlob) {
+        safeAudioBlob = await reviveStoredAudioBlob(safeAudioBlob, {
+          name: audioRecord?.name || stateRecord.project?.project?.audioMeta?.name || stateRecord.project?.audioMeta?.name || '',
+          type: audioRecord?.type || stateRecord.project?.project?.audioMeta?.type || stateRecord.project?.audioMeta?.type || safeAudioBlob.type || 'audio/*',
+        });
+      }
     }
 
     await hydrateProject(stateRecord.project, safeAudioBlob, { fromAutosave: true });
@@ -579,6 +645,19 @@ async function validateBlob(blob) {
   } catch {
     return null;
   }
+}
+
+
+async function reviveStoredAudioBlob(blob, { name = '', type = '' } = {}) {
+  if (!blob) {
+    return null;
+  }
+  const buffer = await blob.arrayBuffer();
+  const mimeType = type || blob.type || 'audio/*';
+  if (name) {
+    return new File([buffer], name, { type: mimeType, lastModified: Date.now() });
+  }
+  return new Blob([buffer], { type: mimeType });
 }
 
 async function clearAutosave() {
@@ -626,30 +705,195 @@ async function ensureAudioContext(resume = false) {
   return runtime.audioContext;
 }
 
-function computeWaveformPeaks(audioBuffer, samples = 2600) {
+function computeWaveformPeaks(audioBuffer) {
   const channelCount = audioBuffer.numberOfChannels;
   const length = audioBuffer.length;
-  const blockSize = Math.max(1, Math.floor(length / samples));
-  const peaks = new Array(samples).fill(0);
-  for (let i = 0; i < samples; i += 1) {
+  const duration = Math.max(audioBuffer.duration || 0, 1);
+  const targetSamples = clamp(Math.round(duration * 120), 4000, 48000);
+  const blockSize = Math.max(1, Math.floor(length / targetSamples));
+  const actualSamples = Math.max(1, Math.ceil(length / blockSize));
+  const min = new Array(actualSamples).fill(0);
+  const max = new Array(actualSamples).fill(0);
+  for (let i = 0; i < actualSamples; i += 1) {
     const start = i * blockSize;
     const end = Math.min(start + blockSize, length);
-    let peak = 0;
+    let blockMin = 1;
+    let blockMax = -1;
     for (let channel = 0; channel < channelCount; channel += 1) {
       const data = audioBuffer.getChannelData(channel);
       for (let j = start; j < end; j += 1) {
-        const value = Math.abs(data[j]);
-        if (value > peak) {
-          peak = value;
+        const value = data[j];
+        if (value < blockMin) {
+          blockMin = value;
+        }
+        if (value > blockMax) {
+          blockMax = value;
         }
       }
     }
-    peaks[i] = peak;
+    min[i] = blockMin === 1 ? 0 : blockMin;
+    max[i] = blockMax === -1 ? 0 : blockMax;
   }
-  return peaks;
+  return { min, max };
 }
 
-async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
+function normalizeWaveformPeaks(peaks) {
+  if (!peaks) {
+    return null;
+  }
+  if (Array.isArray(peaks)) {
+    const max = peaks.map((value) => Math.max(0, value || 0));
+    const min = max.map((value) => -value);
+    return { min, max };
+  }
+  if (Array.isArray(peaks.min) && Array.isArray(peaks.max) && peaks.min.length && peaks.max.length) {
+    return peaks;
+  }
+  return null;
+}
+
+function getWaveformRangeAtTime(peaks, time, duration) {
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  if (!count || duration <= 0) {
+    return { min: 0, max: 0 };
+  }
+  const index = clamp(Math.floor((time / duration) * count), 0, count - 1);
+  return {
+    min: peaks.min[index] || 0,
+    max: peaks.max[index] || 0,
+  };
+}
+
+function getWaveformRangeAtIndices(peaks, startIndex, endIndex) {
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  if (!count) {
+    return { min: 0, max: 0 };
+  }
+  const start = clamp(Math.floor(startIndex), 0, count - 1);
+  const end = clamp(Math.ceil(endIndex), start + 1, count);
+  let min = 0;
+  let max = 0;
+  for (let i = start; i < end; i += 1) {
+    const lo = peaks.min[i] || 0;
+    const hi = peaks.max[i] || 0;
+    if (i === start || lo < min) {
+      min = lo;
+    }
+    if (i === start || hi > max) {
+      max = hi;
+    }
+  }
+  return { min, max };
+}
+
+function buildWaveformLevels(peaks) {
+  const baseCount = Math.min(peaks.min.length, peaks.max.length);
+  if (!baseCount) {
+    return [];
+  }
+  const levels = [];
+  let current = {
+    min: Float32Array.from(peaks.min.slice(0, baseCount)),
+    max: Float32Array.from(peaks.max.slice(0, baseCount)),
+    stride: 1,
+  };
+  levels.push(current);
+  while (current.min.length > 512) {
+    const nextCount = Math.ceil(current.min.length / 2);
+    const nextMin = new Float32Array(nextCount);
+    const nextMax = new Float32Array(nextCount);
+    for (let i = 0; i < nextCount; i += 1) {
+      const left = i * 2;
+      const right = Math.min(left + 1, current.min.length - 1);
+      nextMin[i] = Math.min(current.min[left], current.min[right]);
+      nextMax[i] = Math.max(current.max[left], current.max[right]);
+    }
+    current = {
+      min: nextMin,
+      max: nextMax,
+      stride: current.stride * 2,
+    };
+    levels.push(current);
+  }
+  return levels;
+}
+
+function ensureTimelineWaveformLevels() {
+  const cache = runtime.renderCache.timelineWaveformLevels;
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!peaks) {
+    cache.key = '';
+    cache.levels = null;
+    return null;
+  }
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  const key = [runtime.renderCache.waveformVersion, count].join('|');
+  if (cache.key === key && cache.levels) {
+    return cache.levels;
+  }
+  cache.levels = buildWaveformLevels(peaks);
+  cache.key = key;
+  return cache.levels;
+}
+
+function getWaveformLevelForDensity(levels, basePeaksPerPixel, targetPeaksPerPixel = 1.25) {
+  if (!levels || !levels.length) {
+    return null;
+  }
+  let best = levels[0];
+  let bestScore = Number.POSITIVE_INFINITY;
+  levels.forEach((level) => {
+    const reducedPeaksPerPixel = basePeaksPerPixel / Math.max(1, level.stride);
+    const score = Math.abs(Math.log2(Math.max(EPSILON, reducedPeaksPerPixel) / targetPeaksPerPixel));
+    if (score < bestScore) {
+      best = level;
+      bestScore = score;
+    }
+  });
+  return best;
+}
+
+function drawWaveformShape(ctx, width, height, sampleAtX, { fillStyle, strokeStyle, gain = 0.46 } = {}) {
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+  const mid = height / 2;
+  const amplitudeScale = height * gain;
+  ctx.save();
+  ctx.fillStyle = fillStyle || 'rgba(43, 74, 203, 0.26)';
+  ctx.strokeStyle = strokeStyle || 'rgba(43, 74, 203, 0.72)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  let firstTop = mid;
+  let firstBottom = mid;
+  for (let x = 0; x < width; x += 1) {
+    const range = sampleAtX(x);
+    const top = mid - Math.max(0, range.max) * amplitudeScale;
+    if (x === 0) {
+      firstTop = top;
+      firstBottom = mid - Math.min(0, range.min) * amplitudeScale;
+      ctx.moveTo(0, top);
+    } else {
+      ctx.lineTo(x, top);
+    }
+  }
+  for (let x = width - 1; x >= 0; x -= 1) {
+    const range = sampleAtX(x);
+    const bottom = mid - Math.min(0, range.min) * amplitudeScale;
+    ctx.lineTo(x, bottom);
+  }
+  ctx.lineTo(0, firstBottom);
+  ctx.lineTo(0, firstTop);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+async function loadAudioBlob(blob, { restoreTime = null } = {}) {
+  if (blob && !(blob instanceof File) && !(blob instanceof Blob)) {
+    throw new Error('Invalid audio blob provided.');
+  }
   if (!blob) {
     audioBlob = null;
     parsedAudioMeta = null;
@@ -664,6 +908,8 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
       duration: 0,
     };
     state.waveformPeaks = [];
+    runtime.renderCache.waveformVersion += 1;
+    invalidateRenderCaches();
     revokeCurrentObjectUrl();
     els.audioPlayer.removeAttribute('src');
     els.audioPlayer.load();
@@ -678,10 +924,17 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
     return;
   }
 
-  const previousTime = preservePlaybackPosition ? getCurrentTime() : 0;
+  const seekTime = isFiniteNumber(restoreTime) && restoreTime > 0 ? restoreTime : 0;
+  try {
+    els.audioPlayer.pause();
+    els.audioPlayer.currentTime = 0;
+  } catch (error) {
+    console.warn('Audio reset before load failed:', error);
+  }
   audioBlob = blob;
   revokeCurrentObjectUrl();
   runtime.objectUrl = URL.createObjectURL(blob);
+  els.audioPlayer.preload = 'metadata';
   els.audioPlayer.src = runtime.objectUrl;
   els.audioPlayer.playbackRate = state.settings.playbackRate;
   els.audioPlayer.volume = state.settings.musicVolume;
@@ -696,20 +949,30 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
 
   refreshAudioMeta();
 
-  // Wait for metadata so duration is available, then restore position
-  if (preservePlaybackPosition && isFiniteNumber(previousTime) && previousTime > 0) {
+  // Wait for metadata so duration is available, then restore position.
+  // On Firefox, using a restored Blob too early can transiently report a bad
+  // duration and jump playback to the end, so we also wait for loadeddata.
+  if (seekTime > 0) {
     const applySeek = () => {
       try {
-        const dur = isFiniteNumber(els.audioPlayer.duration) ? els.audioPlayer.duration : (getAudioDuration() || previousTime);
-        els.audioPlayer.currentTime = Math.min(previousTime, dur);
+        const dur = isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0
+          ? els.audioPlayer.duration
+          : (getAudioDuration() || seekTime);
+        els.audioPlayer.currentTime = Math.min(seekTime, dur);
       } catch (err) {
         console.warn('Seek after load failed:', err);
       }
     };
-    if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
+    if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0 && els.audioPlayer.readyState >= 1) {
       applySeek();
     } else {
-      els.audioPlayer.addEventListener('loadedmetadata', applySeek, { once: true });
+      const onReady = () => {
+        els.audioPlayer.removeEventListener('loadedmetadata', onReady);
+        els.audioPlayer.removeEventListener('loadeddata', onReady);
+        applySeek();
+      };
+      els.audioPlayer.addEventListener('loadedmetadata', onReady);
+      els.audioPlayer.addEventListener('loadeddata', onReady);
     }
   }
 
@@ -718,6 +981,8 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
     const arrayBuffer = await blob.arrayBuffer();
     const decoded = await context.decodeAudioData(arrayBuffer.slice(0));
     state.waveformPeaks = computeWaveformPeaks(decoded);
+    runtime.renderCache.waveformVersion += 1;
+    invalidateRenderCaches();
     state.audioMeta.duration = decoded.duration;
   } catch (error) {
     console.warn('Could not decode waveform.', error);
@@ -1227,6 +1492,19 @@ function panViewTo(start) {
   markDirty();
 }
 
+function setPlayheadTimeImmediate(time) {
+  const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
+  try {
+    els.audioPlayer.currentTime = clampedTime;
+  } catch (error) {
+    console.warn(error);
+  }
+  resetAudioOverlayState();
+  updateTransportUi();
+  updateLyricsDynamic();
+  markDirty();
+}
+
 function updateViewRangeLabel() {
   els.viewRangeLabel.textContent = `${formatClock(runtime.view.start, { hundredths: true })} → ${formatClock(runtime.view.start + runtime.view.duration, { hundredths: true })}`;
 }
@@ -1316,6 +1594,7 @@ function syncInputsFromState() {
   els.guideVolumeLabel.textContent = formatPercent(state.settings.guideSynth.volume);
   els.autoPlayOnJump.checked = state.settings.autoPlayOnJump;
   els.autoScrollLyrics.checked = state.settings.autoScrollLyrics;
+  if (els.autoScrollWindow) els.autoScrollWindow.checked = state.settings.autoScrollWindow ?? false;
   els.splitModeSelect.value = state.settings.preprocessing.splitMode;
   els.excludeDoubleNewlines.checked = state.settings.preprocessing.excludeDoubleNewlines;
   els.excludeSectionLabels.checked = state.settings.preprocessing.excludeSectionLabels;
@@ -1645,31 +1924,297 @@ function drawBeatGrid(ctx, width, height, { gutter = 0, alpha = 0.18 } = {}) {
   ctx.restore();
 }
 
+function getTimelineBaseKey(width, height) {
+  const m = state.settings.metronome;
+  return [
+    width,
+    height,
+    runtime.view.start.toFixed(4),
+    runtime.view.duration.toFixed(4),
+    runtime.renderCache.waveformVersion,
+    Number(!!m.enabled),
+    m.bpm,
+    Number(m.offset || 0),
+    m.beatsPerBar,
+  ].join('|');
+}
+
+function renderTimelineBase(ctx, width, height) {
+  drawBackground(ctx, width, height);
+  drawTimelineSelectionRange(ctx, width, height);
+  drawBeatGrid(ctx, width, height - TIMELINE_TRACK_HEIGHT, { alpha: 0.12 });
+  drawWaveform(ctx, width, height - TIMELINE_TRACK_HEIGHT);
+}
+
+function drawTimelineBase(ctx, width, height) {
+  const key = getTimelineBaseKey(width, height);
+  const cache = runtime.renderCache.timelineBase;
+  if (cache.key !== key || !cache.canvas) {
+    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    const cacheCtx = cache.canvas.getContext('2d');
+    renderTimelineBase(cacheCtx, width, height);
+    cache.key = key;
+  }
+  ctx.drawImage(cache.canvas, 0, 0);
+}
+
+function getOverviewBaseKey(width, height, fullDuration) {
+  return [
+    width,
+    height,
+    fullDuration.toFixed(4),
+    runtime.renderCache.waveformVersion,
+  ].join('|');
+}
+
+function renderOverviewBase(ctx, width, height, fullDuration) {
+  drawBackground(ctx, width, height);
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (peaks) {
+    drawWaveformShape(ctx, width, height, (x) => getWaveformRangeAtTime(peaks, (x / Math.max(1, width)) * fullDuration, fullDuration), {
+      fillStyle: 'rgba(43, 74, 203, 0.18)',
+      strokeStyle: 'rgba(43, 74, 203, 0.6)',
+      gain: 0.43,
+    });
+  }
+}
+
+function drawOverviewBase(ctx, width, height, fullDuration) {
+  const key = getOverviewBaseKey(width, height, fullDuration);
+  const cache = runtime.renderCache.overviewBase;
+  if (cache.key !== key || !cache.canvas) {
+    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    const cacheCtx = cache.canvas.getContext('2d');
+    renderOverviewBase(cacheCtx, width, height, fullDuration);
+    cache.key = key;
+  }
+  ctx.drawImage(cache.canvas, 0, 0);
+}
+
+function getPitchBaseKey(width, height) {
+  const m = state.settings.metronome;
+  const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  return [
+    width,
+    height,
+    runtime.view.start.toFixed(4),
+    runtime.view.duration.toFixed(4),
+    minPitch,
+    maxPitch,
+    Number(!!m.enabled),
+    m.bpm,
+    Number(m.offset || 0),
+    m.beatsPerBar,
+  ].join('|');
+}
+
+function renderPitchBase(ctx, width, height) {
+  drawBackground(ctx, width, height);
+  const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  const rowCount = Math.max(1, maxPitch - minPitch + 1);
+  const rowHeight = (height - 16) / rowCount;
+  ctx.save();
+  for (let pitch = maxPitch; pitch >= minPitch; pitch -= 1) {
+    const y = pitchToY(pitch, minPitch, maxPitch, height);
+    const isBlack = [1, 3, 6, 8, 10].includes(((pitch % 12) + 12) % 12);
+    ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
+    ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
+    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+    ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
+  }
+  ctx.restore();
+  drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
+}
+
+function drawPitchBase(ctx, width, height) {
+  const key = getPitchBaseKey(width, height);
+  const cache = runtime.renderCache.pitchBase;
+  if (cache.key !== key || !cache.canvas) {
+    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    const cacheCtx = cache.canvas.getContext('2d');
+    renderPitchBase(cacheCtx, width, height);
+    cache.key = key;
+  }
+  ctx.drawImage(cache.canvas, 0, 0);
+}
+
+
+const TIMELINE_WAVEFORM_TILE_MIN_WIDTH = 1024;
+const TIMELINE_WAVEFORM_TILE_MAX_WIDTH = 2048;
+const TIMELINE_WAVEFORM_TILE_OVERSCAN = 2;
+const TIMELINE_WAVEFORM_MIN_PX_PER_SECOND = 32;
+const TIMELINE_WAVEFORM_MAX_PX_PER_SECOND = 8192;
+const TIMELINE_WAVEFORM_MAX_TILES = 48;
+const TIMELINE_WAVEFORM_DIRECT_MAX_PEAKS_PER_PIXEL = 6;
+
+function getTimelineWaveformTileCacheKey(height, duration) {
+  return [
+    height,
+    duration.toFixed(4),
+    runtime.renderCache.waveformVersion,
+  ].join('|');
+}
+
+function quantizeTimelineWaveformPxPerSecond(targetPxPerSecond) {
+  const clamped = clamp(targetPxPerSecond, TIMELINE_WAVEFORM_MIN_PX_PER_SECOND, TIMELINE_WAVEFORM_MAX_PX_PER_SECOND);
+  const exponent = Math.round(Math.log2(Math.max(1, clamped)));
+  return clamp(2 ** exponent, TIMELINE_WAVEFORM_MIN_PX_PER_SECOND, TIMELINE_WAVEFORM_MAX_PX_PER_SECOND);
+}
+
+function quantizeTimelineWaveformTileWidth(width) {
+  const target = clamp(Math.max(TIMELINE_WAVEFORM_TILE_MIN_WIDTH, width * 1.25), TIMELINE_WAVEFORM_TILE_MIN_WIDTH, TIMELINE_WAVEFORM_TILE_MAX_WIDTH);
+  return 2 ** Math.round(Math.log2(Math.max(1, target)));
+}
+
+function getTimelineWaveformTileConfig(width, height, visibleDuration, duration) {
+  const tileWidth = quantizeTimelineWaveformTileWidth(Math.max(1, width));
+  const targetPxPerSecond = (Math.max(1, width) / Math.max(VIEW_MIN_DURATION, visibleDuration)) * TIMELINE_WAVEFORM_TILE_OVERSCAN;
+  const pxPerSecond = quantizeTimelineWaveformPxPerSecond(targetPxPerSecond);
+  const tileDuration = Math.max(VIEW_MIN_DURATION, tileWidth / pxPerSecond);
+  const tileCount = Math.max(1, Math.ceil(duration / tileDuration));
+  return {
+    pxPerSecond,
+    tileDuration,
+    tileCount,
+    width: tileWidth,
+    height,
+  };
+}
+
+function getTimelineWaveformTile(cacheKey, tileIndex, config) {
+  const cache = runtime.renderCache.timelineWaveformTiles;
+  if (cache.key !== cacheKey) {
+    cache.key = cacheKey;
+    cache.entries = new Map();
+  }
+  const entryKey = [config.pxPerSecond, tileIndex].join('|');
+  const existing = cache.entries.get(entryKey);
+  if (existing) {
+    return existing;
+  }
+  const duration = Math.max(getAudioDuration(), getProjectMaxTime());
+  const levels = ensureTimelineWaveformLevels();
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!levels || !peaks || duration <= 0) {
+    return null;
+  }
+  const basePeakCount = Math.min(peaks.min.length, peaks.max.length);
+  const viewPeakSpan = Math.max(1, (config.tileDuration / duration) * basePeakCount);
+  const basePeaksPerPixel = viewPeakSpan / Math.max(1, config.width);
+  const level = getWaveformLevelForDensity(levels, basePeaksPerPixel) || levels[0];
+  const tileStart = tileIndex * config.tileDuration;
+  const tileEnd = Math.min(duration, tileStart + config.tileDuration);
+  const canvas = createRenderBuffer(config.width, Math.max(1, config.height), null);
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawWaveformFromLevel(ctx, canvas.width, canvas.height, level, tileStart, Math.max(VIEW_MIN_DURATION, tileEnd - tileStart), duration);
+  const entry = {
+    canvas,
+    start: tileStart,
+    end: tileEnd,
+    pxPerSecond: config.pxPerSecond,
+  };
+  cache.entries.set(entryKey, entry);
+  while (cache.entries.size > TIMELINE_WAVEFORM_MAX_TILES) {
+    const oldestKey = cache.entries.keys().next().value;
+    cache.entries.delete(oldestKey);
+  }
+  return entry;
+}
+
+function drawWaveformDirect(ctx, width, height, peaks, visibleStart, visibleDuration, totalDuration) {
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  if (!count || totalDuration <= 0) {
+    return;
+  }
+  const viewPeakStart = (visibleStart / totalDuration) * count;
+  const viewPeakSpan = Math.max(1, (visibleDuration / totalDuration) * count);
+  drawWaveformShape(ctx, width, height, (x) => {
+    const xStart = viewPeakStart + (x / Math.max(1, width)) * viewPeakSpan;
+    const xEnd = viewPeakStart + ((x + 1) / Math.max(1, width)) * viewPeakSpan;
+    return getWaveformRangeAtIndices(peaks, xStart, xEnd);
+  }, {
+    fillStyle: 'rgba(43, 74, 203, 0.2)',
+    strokeStyle: 'rgba(43, 74, 203, 0.72)',
+    gain: 0.45,
+  });
+}
+
+function drawWaveformFromLevel(ctx, width, height, level, visibleStart, visibleDuration, totalDuration) {
+  const count = Math.min(level.min.length, level.max.length);
+  if (!count || totalDuration <= 0) {
+    return;
+  }
+  const viewPeakStart = (visibleStart / totalDuration) * count;
+  const viewPeakSpan = Math.max(1, (visibleDuration / totalDuration) * count);
+  drawWaveformShape(ctx, width, height, (x) => {
+    const xStart = viewPeakStart + (x / Math.max(1, width)) * viewPeakSpan;
+    const xEnd = viewPeakStart + ((x + 1) / Math.max(1, width)) * viewPeakSpan;
+    return getWaveformRangeAtIndices(level, xStart, xEnd);
+  }, {
+    fillStyle: 'rgba(43, 74, 203, 0.2)',
+    strokeStyle: 'rgba(43, 74, 203, 0.72)',
+    gain: 0.45,
+  });
+}
+
 function drawWaveform(ctx, width, height) {
-  const peaks = state.waveformPeaks || [];
-  if (!peaks.length) {
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!peaks) {
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
     ctx.fillText('Load audio to show the waveform.', 16, height / 2);
     ctx.restore();
     return;
   }
   const duration = Math.max(getAudioDuration(), getProjectMaxTime());
-  const mid = height / 2;
-  ctx.save();
-  ctx.strokeStyle = 'rgba(30, 90, 200, 0.55)';
-  ctx.lineWidth = 1;
-  for (let x = 0; x < width; x += 1) {
-    const time = xToTime(x, width, 0);
-    const peakIndex = clamp(Math.floor((time / duration) * peaks.length), 0, peaks.length - 1);
-    const peak = peaks[peakIndex] || 0;
-    const amplitude = peak * (height * 0.46);
-    ctx.beginPath();
-    ctx.moveTo(x + 0.5, mid - amplitude);
-    ctx.lineTo(x + 0.5, mid + amplitude);
-    ctx.stroke();
+  const visibleStart = clamp(runtime.view.start, 0, duration);
+  const visibleDuration = clamp(runtime.view.duration, VIEW_MIN_DURATION, duration);
+  const basePeakCount = Math.min(peaks.min.length, peaks.max.length);
+  const visiblePeakSpan = Math.max(1, (visibleDuration / Math.max(EPSILON, duration)) * basePeakCount);
+  const visiblePeaksPerPixel = visiblePeakSpan / Math.max(1, width);
+
+  if (visiblePeaksPerPixel <= TIMELINE_WAVEFORM_DIRECT_MAX_PEAKS_PER_PIXEL) {
+    drawWaveformDirect(ctx, width, height, peaks, visibleStart, visibleDuration, duration);
+    return;
   }
+
+  const config = getTimelineWaveformTileConfig(width, height, visibleDuration, duration);
+  const cacheKey = getTimelineWaveformTileCacheKey(height, duration);
+  const startTile = Math.max(0, Math.floor(visibleStart / config.tileDuration) - 1);
+  const endTile = Math.min(config.tileCount - 1, Math.ceil((visibleStart + visibleDuration) / config.tileDuration));
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, width, height);
+  ctx.clip();
+  ctx.imageSmoothingEnabled = false;
+
+  for (let tileIndex = startTile; tileIndex <= endTile; tileIndex += 1) {
+    const tile = getTimelineWaveformTile(cacheKey, tileIndex, config);
+    if (!tile) {
+      continue;
+    }
+    const overlapStart = Math.max(tile.start, visibleStart);
+    const overlapEnd = Math.min(tile.end, visibleStart + visibleDuration);
+    if (overlapEnd <= overlapStart) {
+      continue;
+    }
+    const tileDuration = Math.max(EPSILON, tile.end - tile.start);
+    const srcX = ((overlapStart - tile.start) / tileDuration) * tile.canvas.width;
+    const srcW = ((overlapEnd - overlapStart) / tileDuration) * tile.canvas.width;
+    const destX = ((overlapStart - visibleStart) / visibleDuration) * width;
+    const destW = ((overlapEnd - overlapStart) / visibleDuration) * width;
+    if (destX > width || destX + destW < 0 || srcW <= 0 || destW <= 0) {
+      continue;
+    }
+    ctx.drawImage(tile.canvas, srcX, 0, srcW, tile.canvas.height, destX, 0, destW, height);
+  }
+
   ctx.restore();
 }
 
@@ -1686,11 +2231,14 @@ function drawTimelineSelectionRange(ctx, width, height) {
   ctx.restore();
 }
 
-function drawTimelineBlocks(ctx, width, height) {
-  runtime.timelineHitboxes = [];
+function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {}) {
+  if (rebuildHitboxes) {
+    runtime.timelineHitboxes = [];
+  }
   const trackY = height - TIMELINE_TRACK_HEIGHT;
   const trackHeight = TIMELINE_TRACK_HEIGHT - 8;
   const selected = getSelectionEntry();
+  const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
     if (!isFiniteNumber(entry.syllable.start)) {
       return;
@@ -1708,10 +2256,10 @@ function drawTimelineBlocks(ctx, width, height) {
     const w = Math.max(3, x2 - x1);
     const y = trackY;
     const isSelected = selected?.id === entry.id;
-    const isSounding = getCurrentSoundingEntry()?.id === entry.id;
+    const isSounding = soundingEntry?.id === entry.id;
     ctx.save();
-    ctx.fillStyle = isSounding ? 'rgba(210, 90, 20, 0.88)' : isSelected ? 'rgba(30, 90, 200, 0.82)' : 'rgba(20, 160, 100, 0.55)';
-    ctx.strokeStyle = isSelected ? 'rgba(10, 50, 160, 0.9)' : 'rgba(0,0,0,0.12)';
+    ctx.fillStyle = isSelected ? 'rgba(184, 92, 0, 0.88)' : isSounding ? 'rgba(43, 74, 203, 0.82)' : 'rgba(20, 160, 100, 0.55)';
+    ctx.strokeStyle = isSelected ? 'rgba(138, 66, 0, 0.92)' : isSounding ? 'rgba(25, 52, 153, 0.9)' : 'rgba(0,0,0,0.12)';
     ctx.lineWidth = isSelected ? 1.8 : 1;
     roundRect(ctx, x1, y, w, trackHeight, 7);
     ctx.fill();
@@ -1727,40 +2275,44 @@ function drawTimelineBlocks(ctx, width, height) {
     }
     if (w > 20) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
       ctx.fillText(entry.syllable.text, x1 + 6, y + trackHeight / 2 + 4);
     }
     ctx.restore();
 
-    runtime.timelineHitboxes.push({
-      type: 'block',
-      syllableId: entry.id,
-      x: x1,
-      y,
-      w,
-      h: trackHeight,
-    });
+    if (rebuildHitboxes) {
+      runtime.timelineHitboxes.push({
+        type: 'block',
+        syllableId: entry.id,
+        x: x1,
+        y,
+        w,
+        h: trackHeight,
+      });
+    }
 
     if (isSelected) {
       const handleSize = 8 * (window.devicePixelRatio || 1);
-      runtime.timelineHitboxes.push({
-        type: 'start-handle',
-        syllableId: entry.id,
-        x: x1 - handleSize / 2,
-        y,
-        w: handleSize,
-        h: trackHeight,
-      });
-      runtime.timelineHitboxes.push({
-        type: 'end-handle',
-        syllableId: entry.id,
-        x: x2 - handleSize / 2,
-        y,
-        w: handleSize,
-        h: trackHeight,
-      });
+      if (rebuildHitboxes) {
+        runtime.timelineHitboxes.push({
+          type: 'start-handle',
+          syllableId: entry.id,
+          x: x1 - handleSize / 2,
+          y,
+          w: handleSize,
+          h: trackHeight,
+        });
+        runtime.timelineHitboxes.push({
+          type: 'end-handle',
+          syllableId: entry.id,
+          x: x2 - handleSize / 2,
+          y,
+          w: handleSize,
+          h: trackHeight,
+        });
+      }
       ctx.save();
-      ctx.fillStyle = 'rgba(10, 50, 180, 0.95)';
+      ctx.fillStyle = 'rgba(158, 108, 8, 0.95)';
       ctx.fillRect(x1 - 1, y - 1, 2, trackHeight + 2);
       ctx.fillRect(x2 - 1, y - 1, 2, trackHeight + 2);
       ctx.restore();
@@ -1803,41 +2355,21 @@ function drawPlayhead(ctx, width, height, { gutter = 0 } = {}) {
   ctx.restore();
 }
 
-function drawTimeline() {
+function drawTimeline({ rebuildHitboxes = true } = {}) {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.timelineCanvas);
   if (!ctx) return; // Exit if hidden
-  
-  drawBackground(ctx, width, height);
-  drawTimelineSelectionRange(ctx, width, height);
-  drawBeatGrid(ctx, width, height - TIMELINE_TRACK_HEIGHT, { alpha: 0.12 });
-  drawWaveform(ctx, width, height - TIMELINE_TRACK_HEIGHT);
-  drawTimelineBlocks(ctx, width, height);
+
+  drawTimelineBase(ctx, width, height);
+  drawTimelineBlocks(ctx, width, height, { rebuildHitboxes });
   drawPlayhead(ctx, width, height);
 }
 
 function drawOverview() {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.overviewCanvas);
   if (!ctx) return; // Exit if hidden
-  
-  drawBackground(ctx, width, height);
+
   const fullDuration = getProjectMaxTime();
-  const peaks = state.waveformPeaks ||[];
-  if (peaks.length) {
-    const mid = height / 2;
-    ctx.save();
-    ctx.strokeStyle = 'rgba(30, 90, 200, 0.55)';
-    ctx.lineWidth = 1;
-    for (let x = 0; x < width; x += 1) {
-      const peakIndex = clamp(Math.floor((x / width) * peaks.length), 0, peaks.length - 1);
-      const peak = peaks[peakIndex] || 0;
-      const amplitude = peak * (height * 0.44);
-      ctx.beginPath();
-      ctx.moveTo(x + 0.5, mid - amplitude);
-      ctx.lineTo(x + 0.5, mid + amplitude);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
+  drawOverviewBase(ctx, width, height, fullDuration);
   const viewportX = (runtime.view.start / fullDuration) * width;
   const viewportW = Math.max(12, (runtime.view.duration / fullDuration) * width);
   runtime.overviewViewportHitbox = {
@@ -1882,31 +2414,19 @@ function getGhostPitchForSelected() {
   return clamp(runtime.selectedPitchGhost || Math.round((state.settings.pitchRange.min + state.settings.pitchRange.max) / 2), 24, 108);
 }
 
-function drawPitchGuide() {
+function drawPitchGuide({ rebuildHitboxes = true } = {}) {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.pitchCanvas);
   if (!ctx) return; // Exit if hidden
 
-  drawBackground(ctx, width, height);
+  drawPitchBase(ctx, width, height);
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const rowCount = Math.max(1, maxPitch - minPitch + 1);
   const rowHeight = (height - 16) / rowCount;
   const selectedEntry = getSelectionEntry();
-  runtime.pitchHitboxes = [];
-
-  ctx.save();
-  for (let pitch = maxPitch; pitch >= minPitch; pitch -= 1) {
-    const y = pitchToY(pitch, minPitch, maxPitch, height);
-    const isBlack = [1, 3, 6, 8, 10].includes(((pitch % 12) + 12) % 12);
-    ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
-    ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
-    ctx.fillStyle = 'rgba(0,0,0,0.38)';
-    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
-    ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
+  if (rebuildHitboxes) {
+    runtime.pitchHitboxes = [];
   }
-  ctx.restore();
-
-  drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
 
   const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
@@ -1915,6 +2435,9 @@ function drawPitchGuide() {
     const hasPitch = isFiniteNumber(entry.syllable.pitch);
     const shouldShowGhost = selectedEntry?.id === entry.id && !hasPitch && isFiniteNumber(start) && isFiniteNumber(end);
     if (!isFiniteNumber(start) || !isFiniteNumber(end) || (!hasPitch && !shouldShowGhost)) {
+      return;
+    }
+    if (end < runtime.view.start || start > runtime.view.start + runtime.view.duration) {
       return;
     }
     const pitch = hasPitch ? entry.syllable.pitch : getGhostPitchForSelected();
@@ -1928,12 +2451,18 @@ function drawPitchGuide() {
     ctx.save();
     ctx.fillStyle = shouldShowGhost
       ? 'rgba(0,0,0,0.08)'
-      : isSounding
-        ? 'rgba(210, 90, 20, 0.88)'
-        : isSelected
-          ? 'rgba(30, 90, 200, 0.85)'
+      : isSelected
+        ? 'rgba(184, 92, 0, 0.88)'
+        : isSounding
+          ? 'rgba(43, 74, 203, 0.85)'
           : 'rgba(20, 160, 100, 0.65)';
-    ctx.strokeStyle = shouldShowGhost ? 'rgba(0,0,0,0.5)' : 'rgba(255,255,255,0.7)';
+    ctx.strokeStyle = shouldShowGhost
+      ? 'rgba(0,0,0,0.5)'
+      : isSelected
+        ? 'rgba(138, 66, 0, 0.92)'
+        : isSounding
+          ? 'rgba(25, 52, 153, 0.9)'
+          : 'rgba(255,255,255,0.7)';
     ctx.lineWidth = shouldShowGhost ? 1.8 : 1;
     if (shouldShowGhost) {
       ctx.setLineDash([6, 4]);
@@ -1944,19 +2473,21 @@ function drawPitchGuide() {
     ctx.setLineDash([]);
     if (w > 28) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
       ctx.fillText(`${entry.syllable.text} · ${noteNameFromMidi(pitch)}`, x1 + 6, y + h * 0.66);
     }
     ctx.restore();
-    runtime.pitchHitboxes.push({
-      type: shouldShowGhost ? 'ghost-note' : 'note',
-      syllableId: entry.id,
-      x: x1,
-      y,
-      w,
-      h,
-      pitch,
-    });
+    if (rebuildHitboxes) {
+      runtime.pitchHitboxes.push({
+        type: shouldShowGhost ? 'ghost-note' : 'note',
+        syllableId: entry.id,
+        x: x1,
+        y,
+        w,
+        h,
+        pitch,
+      });
+    }
   });
 
   drawPlayhead(ctx, width, height, { gutter: PITCH_GUTTER });
@@ -2237,16 +2768,7 @@ function tapFromSelected() {
 }
 
 async function seekToTime(time, { play = null } = {}) {
-  const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
-  try {
-    els.audioPlayer.currentTime = clampedTime;
-  } catch (error) {
-    console.warn(error);
-  }
-  resetAudioOverlayState();
-  updateTransportUi();
-  updateLyricsDynamic();
-  markDirty();
+  setPlayheadTimeImmediate(time);
   if (play === true) {
     await ensureAudioContext(true);
     try {
@@ -2421,8 +2943,12 @@ function exportJson(filename, payload) {
   anchor.download = filename;
   document.body.appendChild(anchor);
   anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
+  window.requestAnimationFrame(() => {
+    if (anchor.isConnected) {
+      anchor.remove();
+    }
+    URL.revokeObjectURL(url);
+  });
 }
 
 async function exportProject() {
@@ -2459,7 +2985,9 @@ async function importProjectFile(file) {
 async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosave = false } = {}) {
   runtime.loadingProject = true;
   try {
-    const incomingProject = mergeStateDefaults(serialized.project || serialized);
+    const payload = serialized || {};
+    const incomingProject = mergeStateDefaults(payload.project || payload);
+    const restoreTime = isFiniteNumber(payload.playback?.currentTime) ? payload.playback.currentTime : 0;
     uidCounter = 0;
     state = incomingProject;
     state.structure = normalizeStructure(state.structure);
@@ -2468,7 +2996,7 @@ async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosa
     syncInputsFromState();
     fitViewToSong();
     if (providedAudioBlob) {
-      await loadAudioBlob(providedAudioBlob, { preservePlaybackPosition: fromAutosave });
+      await loadAudioBlob(providedAudioBlob, { restoreTime: fromAutosave ? restoreTime : 0 });
     } else {
       audioBlob = null;
       revokeCurrentObjectUrl();
@@ -2582,7 +3110,8 @@ function beginTimelineInteraction(event) {
     }
   }
   runtime.drag = { surface: 'timeline', type: 'scrub' };
-  seekToTime(xToTime(point.x, point.width), { play: false }).catch((error) => console.warn(error));
+  updateEdgeScrollState(point, 0);
+  setPlayheadTimeImmediate(xToTime(point.x, point.width));
 }
 
 function getSnapTime(rawTime, excludeSyllableId, width) {
@@ -2611,7 +3140,8 @@ function moveTimelineInteraction(event) {
   const point = getCanvasPoint(event, els.timelineCanvas);
   const rawTime = xToTime(point.x, point.width);
   if (runtime.drag.type === 'scrub') {
-    seekToTime(rawTime, { play: false }).catch((error) => console.warn(error));
+    updateEdgeScrollState(point, 0);
+    setPlayheadTimeImmediate(rawTime);
     return;
   }
   if (runtime.drag.type === 'start') {
@@ -2641,6 +3171,7 @@ function moveTimelineInteraction(event) {
 function endTimelineInteraction() {
   if (runtime.drag?.surface === 'timeline') {
     runtime.drag = null;
+    runtime.edgeScroll.active = false;
     scheduleAutosave();
   }
 }
@@ -2702,7 +3233,8 @@ function beginPitchInteraction(event) {
     return;
   }
   runtime.drag = { surface: 'pitch', type: 'scrub' };
-  seekToTime(xToTime(point.x, point.width, PITCH_GUTTER), { play: false }).catch((error) => console.warn(error));
+  updateEdgeScrollState(point, PITCH_GUTTER);
+  setPlayheadTimeImmediate(xToTime(point.x, point.width, PITCH_GUTTER));
 }
 
 function movePitchInteraction(event) {
@@ -2711,7 +3243,8 @@ function movePitchInteraction(event) {
   }
   const point = getCanvasPoint(event, els.pitchCanvas);
   if (runtime.drag.type === 'scrub') {
-    seekToTime(xToTime(point.x, point.width, PITCH_GUTTER), { play: false }).catch((error) => console.warn(error));
+    updateEdgeScrollState(point, PITCH_GUTTER);
+    setPlayheadTimeImmediate(xToTime(point.x, point.width, PITCH_GUTTER));
     return;
   }
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
@@ -2723,7 +3256,60 @@ function movePitchInteraction(event) {
 function endPitchInteraction() {
   if (runtime.drag?.surface === 'pitch') {
     runtime.drag = null;
+    runtime.edgeScroll.active = false;
     scheduleAutosave();
+  }
+}
+
+function updateEdgeScrollState(point, gutter = 0) {
+  runtime.edgeScroll.active = runtime.view.duration < Math.max(FULL_VIEW_MIN, getProjectMaxTime());
+  runtime.edgeScroll.pointerX = point.x;
+  runtime.edgeScroll.width = point.width;
+  runtime.edgeScroll.gutter = gutter;
+  if (!runtime.edgeScroll.active) {
+    runtime.edgeScroll.lastTs = 0;
+  }
+}
+
+function applyEdgeScroll(ts) {
+  if (!runtime.drag || runtime.drag.type !== 'scrub' || !runtime.edgeScroll.active) {
+    runtime.edgeScroll.lastTs = ts;
+    return;
+  }
+
+  const { pointerX, width, gutter } = runtime.edgeScroll;
+  const usableWidth = Math.max(1, width - gutter);
+  const localX = pointerX - gutter;
+  const edgeZone = Math.max(24, Math.min(usableWidth * 0.12, 72 * (window.devicePixelRatio || 1)));
+
+  let direction = 0;
+  let intensity = 0;
+  if (localX < edgeZone) {
+    direction = -1;
+    intensity = (edgeZone - localX) / edgeZone;
+  } else if (localX > usableWidth - edgeZone) {
+    direction = 1;
+    intensity = (localX - (usableWidth - edgeZone)) / edgeZone;
+  }
+
+  if (!direction || intensity <= 0) {
+    runtime.edgeScroll.lastTs = ts;
+    return;
+  }
+
+  const dt = runtime.edgeScroll.lastTs ? Math.min(64, ts - runtime.edgeScroll.lastTs) / 1000 : 0;
+  runtime.edgeScroll.lastTs = ts;
+  if (dt <= 0) {
+    return;
+  }
+
+  const secondsPerSecond = runtime.view.duration * (0.45 + Math.pow(Math.min(1.4, intensity), 1.6) * 4.5);
+  const previousStart = runtime.view.start;
+  panViewTo(previousStart + direction * secondsPerSecond * dt);
+
+  if (runtime.view.start !== previousStart) {
+    const clampedX = clamp(pointerX, gutter, width);
+    setPlayheadTimeImmediate(xToTime(clampedX, width, gutter));
   }
 }
 
@@ -2732,9 +3318,18 @@ function onViewWheel(event) {
   const canvas = event.currentTarget;
   const point = getCanvasPoint(event, canvas);
   const gutter = canvas === els.pitchCanvas ? PITCH_GUTTER : 0;
-  const anchorTime = xToTime(point.x, point.width, gutter);
-  const factor = event.deltaY < 0 ? 0.8 : 1.25;
-  zoomView(factor, anchorTime);
+  const usableWidth = Math.max(1, point.width - gutter);
+
+  if (event.deltaX) {
+    const panSeconds = (event.deltaX / usableWidth) * runtime.view.duration;
+    panViewTo(runtime.view.start + panSeconds);
+  }
+
+  if (event.deltaY) {
+    const anchorTime = xToTime(point.x, point.width, gutter);
+    const factor = event.deltaY < 0 ? 0.8 : 1.25;
+    zoomView(factor, anchorTime);
+  }
 }
 
 async function togglePlayPause() {
@@ -2765,6 +3360,18 @@ const nudgeEnd = (e, s) => nudgeSelectedStart(s.settings.nudgeStep)
 const deleteTiming = (e, s) => clearSelectedTiming({ movePrev: false })
 const selectBack = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) - 1, { scroll: true })
 const selectFoward = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) + 1, { scroll: true })
+const selectSounding = () => {
+  const soundingEntry = getCurrentSoundingEntry();
+  if (soundingEntry) {
+    setSelectionSyllableById(soundingEntry.id, { scroll: true, ensureView: true });
+  }
+}
+const jumpToSelectedStart = (e, s) => {
+  const entry = getSelectionEntry();
+  if (!entry || !isFiniteNumber(entry.syllable.start)) return;
+  ensureTimeInView(entry.syllable.start);
+  seekToTime(entry.syllable.start, { play: s.settings.autoPlayOnJump }).catch(console.warn);
+}
 const backspaceHandler = (e, s) => {
   if (s.focusRegion === 'pitch') return clearSelectedPitch();
   if (e.shiftKey) return clearTimingsFromSelectedForward();
@@ -2787,6 +3394,8 @@ const KEY_ACTIONS = {
   '.': nudgeEnd,
   'delete': deleteTiming,
   'backspace': backspaceHandler,
+  'a': selectSounding,
+  'g': jumpToSelectedStart,
   'arrowup': pitchUp,
   'arrowdown': pitchDown,
   '[': selectBack,
@@ -2965,6 +3574,13 @@ function attachEventListeners() {
     scheduleAutosave();
   });
 
+  if (els.autoScrollWindow) {
+    els.autoScrollWindow.addEventListener('change', () => {
+      state.settings.autoScrollWindow = els.autoScrollWindow.checked;
+      scheduleAutosave();
+    });
+  }
+
   els.scrubInput.addEventListener('input', () => {
     seekToTime(Number(els.scrubInput.value), { play: false }).catch((error) => console.warn(error));
   });
@@ -3010,7 +3626,7 @@ function attachEventListeners() {
     els.metronomeVolumeLabel.textContent = formatPercent(state.settings.metronome.volume);
     ensureAudioContext(false).catch((error) => console.warn(error));
     resetAudioOverlayState();
-    markDirty();
+    invalidateRenderCaches('timeline', 'pitch');
     scheduleAutosave();
   };
   els.metronomeEnabled.addEventListener('change', metronomeListener);
@@ -3033,7 +3649,7 @@ function attachEventListeners() {
     state.settings.pitchRange.max = Math.max(minValue, maxValue);
     els.pitchMinInput.value = String(state.settings.pitchRange.min);
     els.pitchMaxInput.value = String(state.settings.pitchRange.max);
-    markDirty();
+    invalidateRenderCaches('pitch');
     scheduleAutosave();
   };
   els.pitchMinInput.addEventListener('change', pitchRangeListener);
@@ -3086,7 +3702,7 @@ function attachEventListeners() {
   }
 
   runtime.resizeObserver = new ResizeObserver(() => {
-    markDirty();
+    invalidateRenderCaches();
   });
   runtime.resizeObserver.observe(els.timelineCanvas);
   runtime.resizeObserver.observe(els.overviewCanvas);
@@ -3233,18 +3849,50 @@ function updateTitleFromMeta() {
   document.title = name ? `${name} · Syllable KS` : 'Syllable Karaoke Studio';
 }
 
-function animate() {
+function applyPlayheadWindowAutoscroll() {
+  if (!state.settings.autoScrollWindow || els.audioPlayer.paused) {
+    return;
+  }
+  const fullDuration = Math.max(FULL_VIEW_MIN, getProjectMaxTime());
+  if (runtime.view.duration >= fullDuration) {
+    return;
+  }
+  const currentTime = getCurrentTime();
+  const viewEnd = runtime.view.start + runtime.view.duration;
+  if (currentTime >= viewEnd - EPSILON) {
+    const nextStart = clamp(currentTime, 0, Math.max(0, fullDuration - runtime.view.duration));
+    if (nextStart !== runtime.view.start) {
+      runtime.view.start = nextStart;
+      clampView();
+      markDirty();
+    }
+  }
+}
+
+function animate(ts) {
+  applyEdgeScroll(ts);
+  applyPlayheadWindowAutoscroll();
   applyLooping();
   scheduleMetronomeClicks();
   updateGuideVoice();
   updateTransportUi();
   updateLyricsDynamic();
   updateMediaSessionPosition();
-  if (runtime.drawDirty || !els.audioPlayer.paused || runtime.drag) {
-    drawTimeline();
+  const currentTime = getCurrentTime();
+  const isPlaying = !els.audioPlayer.paused;
+  const timeAdvanced = runtime.lastDrawnTime === null || Math.abs(currentTime - runtime.lastDrawnTime) > 1 / 240;
+  const needsInteractiveRedraw = Boolean(runtime.drawDirty || runtime.drag);
+  if (needsInteractiveRedraw) {
+    drawTimeline({ rebuildHitboxes: true });
     drawOverview();
-    drawPitchGuide();
+    drawPitchGuide({ rebuildHitboxes: true });
     runtime.drawDirty = false;
+    runtime.lastDrawnTime = currentTime;
+  } else if (isPlaying && timeAdvanced) {
+    drawTimeline({ rebuildHitboxes: false });
+    drawOverview();
+    drawPitchGuide({ rebuildHitboxes: false });
+    runtime.lastDrawnTime = currentTime;
   }
   requestAnimationFrame(animate);
 }
