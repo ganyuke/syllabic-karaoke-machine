@@ -480,6 +480,10 @@ function serializeProject() {
     appId: APP_ID,
     version: APP_VERSION,
     updatedAt: new Date().toISOString(),
+    playback: {
+      currentTime: getCurrentTime(),
+      wasPlaying: !els.audioPlayer.paused,
+    },
     project: deepClone(state),
   };
 }
@@ -596,12 +600,23 @@ async function loadAutosave() {
       return;
     }
 
-    // Validate audio blob before using it — a partial write from a
-    // mid-flight page unload can leave a blob with size > 0 but
-    // truncated data. Read a small slice to confirm it's intact.
+    // Firefox can return a Blob from IndexedDB that is technically readable
+    // but still flaky when used directly as media src. Materialize the full
+    // byte payload into a fresh Blob/File before handing it to <audio>.
     let safeAudioBlob = null;
     if (audioRecord?.audioBlob) {
       safeAudioBlob = await validateBlob(audioRecord.audioBlob);
+      const expectedSize = Number(stateRecord.project?.project?.audioMeta?.size || stateRecord.project?.audioMeta?.size || 0);
+      if (safeAudioBlob && expectedSize > 0 && safeAudioBlob.size !== expectedSize) {
+        console.warn('Ignoring autosaved audio blob with unexpected size.', { expectedSize, actualSize: safeAudioBlob.size });
+        safeAudioBlob = null;
+      }
+      if (safeAudioBlob) {
+        safeAudioBlob = await reviveStoredAudioBlob(safeAudioBlob, {
+          name: audioRecord?.name || stateRecord.project?.project?.audioMeta?.name || stateRecord.project?.audioMeta?.name || '',
+          type: audioRecord?.type || stateRecord.project?.project?.audioMeta?.type || stateRecord.project?.audioMeta?.type || safeAudioBlob.type || 'audio/*',
+        });
+      }
     }
 
     await hydrateProject(stateRecord.project, safeAudioBlob, { fromAutosave: true });
@@ -630,6 +645,19 @@ async function validateBlob(blob) {
   } catch {
     return null;
   }
+}
+
+
+async function reviveStoredAudioBlob(blob, { name = '', type = '' } = {}) {
+  if (!blob) {
+    return null;
+  }
+  const buffer = await blob.arrayBuffer();
+  const mimeType = type || blob.type || 'audio/*';
+  if (name) {
+    return new File([buffer], name, { type: mimeType, lastModified: Date.now() });
+  }
+  return new Blob([buffer], { type: mimeType });
 }
 
 async function clearAutosave() {
@@ -862,7 +890,10 @@ function drawWaveformShape(ctx, width, height, sampleAtX, { fillStyle, strokeSty
   ctx.restore();
 }
 
-async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
+async function loadAudioBlob(blob, { restoreTime = null } = {}) {
+  if (blob && !(blob instanceof File) && !(blob instanceof Blob)) {
+    throw new Error('Invalid audio blob provided.');
+  }
   if (!blob) {
     audioBlob = null;
     parsedAudioMeta = null;
@@ -893,10 +924,17 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
     return;
   }
 
-  const previousTime = preservePlaybackPosition ? getCurrentTime() : 0;
+  const seekTime = isFiniteNumber(restoreTime) && restoreTime > 0 ? restoreTime : 0;
+  try {
+    els.audioPlayer.pause();
+    els.audioPlayer.currentTime = 0;
+  } catch (error) {
+    console.warn('Audio reset before load failed:', error);
+  }
   audioBlob = blob;
   revokeCurrentObjectUrl();
   runtime.objectUrl = URL.createObjectURL(blob);
+  els.audioPlayer.preload = 'metadata';
   els.audioPlayer.src = runtime.objectUrl;
   els.audioPlayer.playbackRate = state.settings.playbackRate;
   els.audioPlayer.volume = state.settings.musicVolume;
@@ -911,20 +949,30 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
 
   refreshAudioMeta();
 
-  // Wait for metadata so duration is available, then restore position
-  if (preservePlaybackPosition && isFiniteNumber(previousTime) && previousTime > 0) {
+  // Wait for metadata so duration is available, then restore position.
+  // On Firefox, using a restored Blob too early can transiently report a bad
+  // duration and jump playback to the end, so we also wait for loadeddata.
+  if (seekTime > 0) {
     const applySeek = () => {
       try {
-        const dur = isFiniteNumber(els.audioPlayer.duration) ? els.audioPlayer.duration : (getAudioDuration() || previousTime);
-        els.audioPlayer.currentTime = Math.min(previousTime, dur);
+        const dur = isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0
+          ? els.audioPlayer.duration
+          : (getAudioDuration() || seekTime);
+        els.audioPlayer.currentTime = Math.min(seekTime, dur);
       } catch (err) {
         console.warn('Seek after load failed:', err);
       }
     };
-    if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
+    if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0 && els.audioPlayer.readyState >= 1) {
       applySeek();
     } else {
-      els.audioPlayer.addEventListener('loadedmetadata', applySeek, { once: true });
+      const onReady = () => {
+        els.audioPlayer.removeEventListener('loadedmetadata', onReady);
+        els.audioPlayer.removeEventListener('loadeddata', onReady);
+        applySeek();
+      };
+      els.audioPlayer.addEventListener('loadedmetadata', onReady);
+      els.audioPlayer.addEventListener('loadeddata', onReady);
     }
   }
 
@@ -2895,8 +2943,12 @@ function exportJson(filename, payload) {
   anchor.download = filename;
   document.body.appendChild(anchor);
   anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
+  window.requestAnimationFrame(() => {
+    if (anchor.isConnected) {
+      anchor.remove();
+    }
+    URL.revokeObjectURL(url);
+  });
 }
 
 async function exportProject() {
@@ -2933,7 +2985,9 @@ async function importProjectFile(file) {
 async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosave = false } = {}) {
   runtime.loadingProject = true;
   try {
-    const incomingProject = mergeStateDefaults(serialized.project || serialized);
+    const payload = serialized || {};
+    const incomingProject = mergeStateDefaults(payload.project || payload);
+    const restoreTime = isFiniteNumber(payload.playback?.currentTime) ? payload.playback.currentTime : 0;
     uidCounter = 0;
     state = incomingProject;
     state.structure = normalizeStructure(state.structure);
@@ -2942,7 +2996,7 @@ async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosa
     syncInputsFromState();
     fitViewToSong();
     if (providedAudioBlob) {
-      await loadAudioBlob(providedAudioBlob, { preservePlaybackPosition: fromAutosave });
+      await loadAudioBlob(providedAudioBlob, { restoreTime: fromAutosave ? restoreTime : 0 });
     } else {
       audioBlob = null;
       revokeCurrentObjectUrl();
