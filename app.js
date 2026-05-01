@@ -44,6 +44,7 @@ const defaultState = () => ({
     musicVolume: 1,
     autoPlayOnJump: true,
     autoScrollLyrics: true,
+    autoScrollWindow: false,
     loopSelection: false,
     preprocessing: {
       splitMode: 'manual',
@@ -171,6 +172,7 @@ const els = {
   guideVolumeLabel: document.getElementById('guideVolumeLabel'),
   autoPlayOnJump: document.getElementById('autoPlayOnJump'),
   autoScrollLyrics: document.getElementById('autoScrollLyrics'),
+  autoScrollWindow: document.getElementById('autoScrollWindow'),
   selectedSummary: document.getElementById('selectedSummary'),
   currentTimeLabel: document.getElementById('currentTimeLabel'),
   scrubInput: document.getElementById('scrubInput'),
@@ -399,6 +401,7 @@ function mergeStateDefaults(project) {
       },
       followSounding: incoming.settings?.followSounding ?? base.settings.followSounding,
       selectWithoutSeek: incoming.settings?.selectWithoutSeek ?? base.settings.selectWithoutSeek,
+      autoScrollWindow: incoming.settings?.autoScrollWindow ?? base.settings.autoScrollWindow,
     },
     selection: {
       ...base.selection,
@@ -1336,6 +1339,7 @@ function syncInputsFromState() {
   els.guideVolumeLabel.textContent = formatPercent(state.settings.guideSynth.volume);
   els.autoPlayOnJump.checked = state.settings.autoPlayOnJump;
   els.autoScrollLyrics.checked = state.settings.autoScrollLyrics;
+  if (els.autoScrollWindow) els.autoScrollWindow.checked = state.settings.autoScrollWindow ?? false;
   els.splitModeSelect.value = state.settings.preprocessing.splitMode;
   els.excludeDoubleNewlines.checked = state.settings.preprocessing.excludeDoubleNewlines;
   els.excludeSectionLabels.checked = state.settings.preprocessing.excludeSectionLabels;
@@ -1730,8 +1734,8 @@ function drawTimelineBlocks(ctx, width, height) {
     const isSelected = selected?.id === entry.id;
     const isSounding = getCurrentSoundingEntry()?.id === entry.id;
     ctx.save();
-    ctx.fillStyle = isSelected ? 'rgba(214, 160, 34, 0.88)' : isSounding ? 'rgba(43, 74, 203, 0.82)' : 'rgba(20, 160, 100, 0.55)';
-    ctx.strokeStyle = isSelected ? 'rgba(158, 108, 8, 0.92)' : isSounding ? 'rgba(25, 52, 153, 0.9)' : 'rgba(0,0,0,0.12)';
+    ctx.fillStyle = isSelected ? 'rgba(184, 92, 0, 0.88)' : isSounding ? 'rgba(43, 74, 203, 0.82)' : 'rgba(20, 160, 100, 0.55)';
+    ctx.strokeStyle = isSelected ? 'rgba(138, 66, 0, 0.92)' : isSounding ? 'rgba(25, 52, 153, 0.9)' : 'rgba(0,0,0,0.12)';
     ctx.lineWidth = isSelected ? 1.8 : 1;
     roundRect(ctx, x1, y, w, trackHeight, 7);
     ctx.fill();
@@ -1949,14 +1953,14 @@ function drawPitchGuide() {
     ctx.fillStyle = shouldShowGhost
       ? 'rgba(0,0,0,0.08)'
       : isSelected
-        ? 'rgba(214, 160, 34, 0.88)'
+        ? 'rgba(184, 92, 0, 0.88)'
         : isSounding
           ? 'rgba(43, 74, 203, 0.85)'
           : 'rgba(20, 160, 100, 0.65)';
     ctx.strokeStyle = shouldShowGhost
       ? 'rgba(0,0,0,0.5)'
       : isSelected
-        ? 'rgba(158, 108, 8, 0.92)'
+        ? 'rgba(138, 66, 0, 0.92)'
         : isSounding
           ? 'rgba(25, 52, 153, 0.9)'
           : 'rgba(255,255,255,0.7)';
@@ -3063,6 +3067,13 @@ function attachEventListeners() {
     scheduleAutosave();
   });
 
+  if (els.autoScrollWindow) {
+    els.autoScrollWindow.addEventListener('change', () => {
+      state.settings.autoScrollWindow = els.autoScrollWindow.checked;
+      scheduleAutosave();
+    });
+  }
+
   els.scrubInput.addEventListener('input', () => {
     seekToTime(Number(els.scrubInput.value), { play: false }).catch((error) => console.warn(error));
   });
@@ -3331,8 +3342,29 @@ function updateTitleFromMeta() {
   document.title = name ? `${name} · Syllable KS` : 'Syllable Karaoke Studio';
 }
 
+function applyPlayheadWindowAutoscroll() {
+  if (!state.settings.autoScrollWindow || els.audioPlayer.paused) {
+    return;
+  }
+  const fullDuration = Math.max(FULL_VIEW_MIN, getProjectMaxTime());
+  if (runtime.view.duration >= fullDuration) {
+    return;
+  }
+  const currentTime = getCurrentTime();
+  const viewEnd = runtime.view.start + runtime.view.duration;
+  if (currentTime >= viewEnd - EPSILON) {
+    const nextStart = clamp(currentTime, 0, Math.max(0, fullDuration - runtime.view.duration));
+    if (nextStart !== runtime.view.start) {
+      runtime.view.start = nextStart;
+      clampView();
+      markDirty();
+    }
+  }
+}
+
 function animate(ts) {
   applyEdgeScroll(ts);
+  applyPlayheadWindowAutoscroll();
   applyLooping();
   scheduleMetronomeClicks();
   updateGuideVoice();
