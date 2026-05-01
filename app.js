@@ -130,6 +130,16 @@ const runtime = {
     lastTs: 0,
   },
   lastAutoScrolledLineId: null,
+  renderCache: {
+    fontFamily: '',
+    timelineBase: { canvas: null, key: '' },
+    overviewBase: { canvas: null, key: '' },
+    pitchBase: { canvas: null, key: '' },
+    timelineWaveformTiles: { key: '', entries: new Map() },
+    timelineWaveformLevels: { key: '', levels: null },
+    waveformVersion: 0,
+  },
+  lastDrawnTime: null,
 };
 
 const els = {
@@ -344,6 +354,37 @@ function setFocusRegion(region) {
 
 function markDirty() {
   runtime.drawDirty = true;
+}
+
+function getUiFontFamily() {
+  if (!runtime.renderCache.fontFamily) {
+    runtime.renderCache.fontFamily = getComputedStyle(document.body).fontFamily;
+  }
+  return runtime.renderCache.fontFamily;
+}
+
+function invalidateRenderCaches(...keys) {
+  if (!keys.length || keys.includes('timeline')) {
+    runtime.renderCache.timelineBase.key = '';
+    runtime.renderCache.timelineWaveformTiles.key = '';
+    runtime.renderCache.timelineWaveformTiles.entries = new Map();
+  }
+  if (!keys.length || keys.includes('overview')) {
+    runtime.renderCache.overviewBase.key = '';
+  }
+  if (!keys.length || keys.includes('pitch')) {
+    runtime.renderCache.pitchBase.key = '';
+  }
+  runtime.drawDirty = true;
+}
+
+function createRenderBuffer(width, height, existingCanvas = null) {
+  const canvas = existingCanvas || document.createElement('canvas');
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return canvas;
 }
 
 function getAudioDuration() {
@@ -695,33 +736,126 @@ function getWaveformRangeAtTime(peaks, time, duration) {
   };
 }
 
-function drawWaveformShape(ctx, width, height, sampleAtX, { fillStyle, strokeStyle, gain = 0.46 } = {}) {
-  const upper = [];
-  const lower = [];
-  const mid = height / 2;
-  const amplitudeScale = height * gain;
-  for (let x = 0; x < width; x += 1) {
-    const range = sampleAtX(x);
-    const top = mid - Math.max(0, range.max) * amplitudeScale;
-    const bottom = mid - Math.min(0, range.min) * amplitudeScale;
-    upper.push([x, top]);
-    lower.push([x, bottom]);
+function getWaveformRangeAtIndices(peaks, startIndex, endIndex) {
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  if (!count) {
+    return { min: 0, max: 0 };
   }
-  if (!upper.length) {
+  const start = clamp(Math.floor(startIndex), 0, count - 1);
+  const end = clamp(Math.ceil(endIndex), start + 1, count);
+  let min = 0;
+  let max = 0;
+  for (let i = start; i < end; i += 1) {
+    const lo = peaks.min[i] || 0;
+    const hi = peaks.max[i] || 0;
+    if (i === start || lo < min) {
+      min = lo;
+    }
+    if (i === start || hi > max) {
+      max = hi;
+    }
+  }
+  return { min, max };
+}
+
+function buildWaveformLevels(peaks) {
+  const baseCount = Math.min(peaks.min.length, peaks.max.length);
+  if (!baseCount) {
+    return [];
+  }
+  const levels = [];
+  let current = {
+    min: Float32Array.from(peaks.min.slice(0, baseCount)),
+    max: Float32Array.from(peaks.max.slice(0, baseCount)),
+    stride: 1,
+  };
+  levels.push(current);
+  while (current.min.length > 512) {
+    const nextCount = Math.ceil(current.min.length / 2);
+    const nextMin = new Float32Array(nextCount);
+    const nextMax = new Float32Array(nextCount);
+    for (let i = 0; i < nextCount; i += 1) {
+      const left = i * 2;
+      const right = Math.min(left + 1, current.min.length - 1);
+      nextMin[i] = Math.min(current.min[left], current.min[right]);
+      nextMax[i] = Math.max(current.max[left], current.max[right]);
+    }
+    current = {
+      min: nextMin,
+      max: nextMax,
+      stride: current.stride * 2,
+    };
+    levels.push(current);
+  }
+  return levels;
+}
+
+function ensureTimelineWaveformLevels() {
+  const cache = runtime.renderCache.timelineWaveformLevels;
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!peaks) {
+    cache.key = '';
+    cache.levels = null;
+    return null;
+  }
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  const key = [runtime.renderCache.waveformVersion, count].join('|');
+  if (cache.key === key && cache.levels) {
+    return cache.levels;
+  }
+  cache.levels = buildWaveformLevels(peaks);
+  cache.key = key;
+  return cache.levels;
+}
+
+function getWaveformLevelForDensity(levels, basePeaksPerPixel, targetPeaksPerPixel = 1.25) {
+  if (!levels || !levels.length) {
+    return null;
+  }
+  let best = levels[0];
+  let bestScore = Number.POSITIVE_INFINITY;
+  levels.forEach((level) => {
+    const reducedPeaksPerPixel = basePeaksPerPixel / Math.max(1, level.stride);
+    const score = Math.abs(Math.log2(Math.max(EPSILON, reducedPeaksPerPixel) / targetPeaksPerPixel));
+    if (score < bestScore) {
+      best = level;
+      bestScore = score;
+    }
+  });
+  return best;
+}
+
+function drawWaveformShape(ctx, width, height, sampleAtX, { fillStyle, strokeStyle, gain = 0.46 } = {}) {
+  if (width <= 0 || height <= 0) {
     return;
   }
+  const mid = height / 2;
+  const amplitudeScale = height * gain;
   ctx.save();
   ctx.fillStyle = fillStyle || 'rgba(43, 74, 203, 0.26)';
   ctx.strokeStyle = strokeStyle || 'rgba(43, 74, 203, 0.72)';
   ctx.lineWidth = 1;
   ctx.beginPath();
-  ctx.moveTo(upper[0][0], upper[0][1]);
-  for (let i = 1; i < upper.length; i += 1) {
-    ctx.lineTo(upper[i][0], upper[i][1]);
+  let firstTop = mid;
+  let firstBottom = mid;
+  for (let x = 0; x < width; x += 1) {
+    const range = sampleAtX(x);
+    const top = mid - Math.max(0, range.max) * amplitudeScale;
+    if (x === 0) {
+      firstTop = top;
+      firstBottom = mid - Math.min(0, range.min) * amplitudeScale;
+      ctx.moveTo(0, top);
+    } else {
+      ctx.lineTo(x, top);
+    }
   }
-  for (let i = lower.length - 1; i >= 0; i -= 1) {
-    ctx.lineTo(lower[i][0], lower[i][1]);
+  for (let x = width - 1; x >= 0; x -= 1) {
+    const range = sampleAtX(x);
+    const bottom = mid - Math.min(0, range.min) * amplitudeScale;
+    ctx.lineTo(x, bottom);
   }
+  ctx.lineTo(0, firstBottom);
+  ctx.lineTo(0, firstTop);
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
@@ -743,6 +877,8 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
       duration: 0,
     };
     state.waveformPeaks = [];
+    runtime.renderCache.waveformVersion += 1;
+    invalidateRenderCaches();
     revokeCurrentObjectUrl();
     els.audioPlayer.removeAttribute('src');
     els.audioPlayer.load();
@@ -797,6 +933,8 @@ async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
     const arrayBuffer = await blob.arrayBuffer();
     const decoded = await context.decodeAudioData(arrayBuffer.slice(0));
     state.waveformPeaks = computeWaveformPeaks(decoded);
+    runtime.renderCache.waveformVersion += 1;
+    invalidateRenderCaches();
     state.audioMeta.duration = decoded.duration;
   } catch (error) {
     console.warn('Could not decode waveform.', error);
@@ -1738,25 +1876,298 @@ function drawBeatGrid(ctx, width, height, { gutter = 0, alpha = 0.18 } = {}) {
   ctx.restore();
 }
 
-function drawWaveform(ctx, width, height) {
+function getTimelineBaseKey(width, height) {
+  const m = state.settings.metronome;
+  return [
+    width,
+    height,
+    runtime.view.start.toFixed(4),
+    runtime.view.duration.toFixed(4),
+    runtime.renderCache.waveformVersion,
+    Number(!!m.enabled),
+    m.bpm,
+    Number(m.offset || 0),
+    m.beatsPerBar,
+  ].join('|');
+}
+
+function renderTimelineBase(ctx, width, height) {
+  drawBackground(ctx, width, height);
+  drawTimelineSelectionRange(ctx, width, height);
+  drawBeatGrid(ctx, width, height - TIMELINE_TRACK_HEIGHT, { alpha: 0.12 });
+  drawWaveform(ctx, width, height - TIMELINE_TRACK_HEIGHT);
+}
+
+function drawTimelineBase(ctx, width, height) {
+  const key = getTimelineBaseKey(width, height);
+  const cache = runtime.renderCache.timelineBase;
+  if (cache.key !== key || !cache.canvas) {
+    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    const cacheCtx = cache.canvas.getContext('2d');
+    renderTimelineBase(cacheCtx, width, height);
+    cache.key = key;
+  }
+  ctx.drawImage(cache.canvas, 0, 0);
+}
+
+function getOverviewBaseKey(width, height, fullDuration) {
+  return [
+    width,
+    height,
+    fullDuration.toFixed(4),
+    runtime.renderCache.waveformVersion,
+  ].join('|');
+}
+
+function renderOverviewBase(ctx, width, height, fullDuration) {
+  drawBackground(ctx, width, height);
   const peaks = normalizeWaveformPeaks(state.waveformPeaks);
-  if (!peaks) {
-    ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
-    ctx.fillText('Load audio to show the waveform.', 16, height / 2);
-    ctx.restore();
-    return;
+  if (peaks) {
+    drawWaveformShape(ctx, width, height, (x) => getWaveformRangeAtTime(peaks, (x / Math.max(1, width)) * fullDuration, fullDuration), {
+      fillStyle: 'rgba(43, 74, 203, 0.18)',
+      strokeStyle: 'rgba(43, 74, 203, 0.6)',
+      gain: 0.43,
+    });
+  }
+}
+
+function drawOverviewBase(ctx, width, height, fullDuration) {
+  const key = getOverviewBaseKey(width, height, fullDuration);
+  const cache = runtime.renderCache.overviewBase;
+  if (cache.key !== key || !cache.canvas) {
+    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    const cacheCtx = cache.canvas.getContext('2d');
+    renderOverviewBase(cacheCtx, width, height, fullDuration);
+    cache.key = key;
+  }
+  ctx.drawImage(cache.canvas, 0, 0);
+}
+
+function getPitchBaseKey(width, height) {
+  const m = state.settings.metronome;
+  const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  return [
+    width,
+    height,
+    runtime.view.start.toFixed(4),
+    runtime.view.duration.toFixed(4),
+    minPitch,
+    maxPitch,
+    Number(!!m.enabled),
+    m.bpm,
+    Number(m.offset || 0),
+    m.beatsPerBar,
+  ].join('|');
+}
+
+function renderPitchBase(ctx, width, height) {
+  drawBackground(ctx, width, height);
+  const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
+  const rowCount = Math.max(1, maxPitch - minPitch + 1);
+  const rowHeight = (height - 16) / rowCount;
+  ctx.save();
+  for (let pitch = maxPitch; pitch >= minPitch; pitch -= 1) {
+    const y = pitchToY(pitch, minPitch, maxPitch, height);
+    const isBlack = [1, 3, 6, 8, 10].includes(((pitch % 12) + 12) % 12);
+    ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
+    ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
+    ctx.fillStyle = 'rgba(0,0,0,0.38)';
+    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+    ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
+  }
+  ctx.restore();
+  drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
+}
+
+function drawPitchBase(ctx, width, height) {
+  const key = getPitchBaseKey(width, height);
+  const cache = runtime.renderCache.pitchBase;
+  if (cache.key !== key || !cache.canvas) {
+    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    const cacheCtx = cache.canvas.getContext('2d');
+    renderPitchBase(cacheCtx, width, height);
+    cache.key = key;
+  }
+  ctx.drawImage(cache.canvas, 0, 0);
+}
+
+
+const TIMELINE_WAVEFORM_TILE_MIN_WIDTH = 1024;
+const TIMELINE_WAVEFORM_TILE_MAX_WIDTH = 2048;
+const TIMELINE_WAVEFORM_TILE_OVERSCAN = 2;
+const TIMELINE_WAVEFORM_MIN_PX_PER_SECOND = 32;
+const TIMELINE_WAVEFORM_MAX_PX_PER_SECOND = 8192;
+const TIMELINE_WAVEFORM_MAX_TILES = 48;
+const TIMELINE_WAVEFORM_DIRECT_MAX_PEAKS_PER_PIXEL = 6;
+
+function getTimelineWaveformTileCacheKey(height, duration) {
+  return [
+    height,
+    duration.toFixed(4),
+    runtime.renderCache.waveformVersion,
+  ].join('|');
+}
+
+function quantizeTimelineWaveformPxPerSecond(targetPxPerSecond) {
+  const clamped = clamp(targetPxPerSecond, TIMELINE_WAVEFORM_MIN_PX_PER_SECOND, TIMELINE_WAVEFORM_MAX_PX_PER_SECOND);
+  const exponent = Math.round(Math.log2(Math.max(1, clamped)));
+  return clamp(2 ** exponent, TIMELINE_WAVEFORM_MIN_PX_PER_SECOND, TIMELINE_WAVEFORM_MAX_PX_PER_SECOND);
+}
+
+function quantizeTimelineWaveformTileWidth(width) {
+  const target = clamp(Math.max(TIMELINE_WAVEFORM_TILE_MIN_WIDTH, width * 1.25), TIMELINE_WAVEFORM_TILE_MIN_WIDTH, TIMELINE_WAVEFORM_TILE_MAX_WIDTH);
+  return 2 ** Math.round(Math.log2(Math.max(1, target)));
+}
+
+function getTimelineWaveformTileConfig(width, height, visibleDuration, duration) {
+  const tileWidth = quantizeTimelineWaveformTileWidth(Math.max(1, width));
+  const targetPxPerSecond = (Math.max(1, width) / Math.max(VIEW_MIN_DURATION, visibleDuration)) * TIMELINE_WAVEFORM_TILE_OVERSCAN;
+  const pxPerSecond = quantizeTimelineWaveformPxPerSecond(targetPxPerSecond);
+  const tileDuration = Math.max(VIEW_MIN_DURATION, tileWidth / pxPerSecond);
+  const tileCount = Math.max(1, Math.ceil(duration / tileDuration));
+  return {
+    pxPerSecond,
+    tileDuration,
+    tileCount,
+    width: tileWidth,
+    height,
+  };
+}
+
+function getTimelineWaveformTile(cacheKey, tileIndex, config) {
+  const cache = runtime.renderCache.timelineWaveformTiles;
+  if (cache.key !== cacheKey) {
+    cache.key = cacheKey;
+    cache.entries = new Map();
+  }
+  const entryKey = [config.pxPerSecond, tileIndex].join('|');
+  const existing = cache.entries.get(entryKey);
+  if (existing) {
+    return existing;
   }
   const duration = Math.max(getAudioDuration(), getProjectMaxTime());
+  const levels = ensureTimelineWaveformLevels();
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!levels || !peaks || duration <= 0) {
+    return null;
+  }
+  const basePeakCount = Math.min(peaks.min.length, peaks.max.length);
+  const viewPeakSpan = Math.max(1, (config.tileDuration / duration) * basePeakCount);
+  const basePeaksPerPixel = viewPeakSpan / Math.max(1, config.width);
+  const level = getWaveformLevelForDensity(levels, basePeaksPerPixel) || levels[0];
+  const tileStart = tileIndex * config.tileDuration;
+  const tileEnd = Math.min(duration, tileStart + config.tileDuration);
+  const canvas = createRenderBuffer(config.width, Math.max(1, config.height), null);
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawWaveformFromLevel(ctx, canvas.width, canvas.height, level, tileStart, Math.max(VIEW_MIN_DURATION, tileEnd - tileStart), duration);
+  const entry = {
+    canvas,
+    start: tileStart,
+    end: tileEnd,
+    pxPerSecond: config.pxPerSecond,
+  };
+  cache.entries.set(entryKey, entry);
+  while (cache.entries.size > TIMELINE_WAVEFORM_MAX_TILES) {
+    const oldestKey = cache.entries.keys().next().value;
+    cache.entries.delete(oldestKey);
+  }
+  return entry;
+}
+
+function drawWaveformDirect(ctx, width, height, peaks, visibleStart, visibleDuration, totalDuration) {
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  if (!count || totalDuration <= 0) {
+    return;
+  }
+  const viewPeakStart = (visibleStart / totalDuration) * count;
+  const viewPeakSpan = Math.max(1, (visibleDuration / totalDuration) * count);
   drawWaveformShape(ctx, width, height, (x) => {
-    const time = xToTime(x, width, 0);
-    return getWaveformRangeAtTime(peaks, time, duration);
+    const xStart = viewPeakStart + (x / Math.max(1, width)) * viewPeakSpan;
+    const xEnd = viewPeakStart + ((x + 1) / Math.max(1, width)) * viewPeakSpan;
+    return getWaveformRangeAtIndices(peaks, xStart, xEnd);
   }, {
     fillStyle: 'rgba(43, 74, 203, 0.2)',
     strokeStyle: 'rgba(43, 74, 203, 0.72)',
     gain: 0.45,
   });
+}
+
+function drawWaveformFromLevel(ctx, width, height, level, visibleStart, visibleDuration, totalDuration) {
+  const count = Math.min(level.min.length, level.max.length);
+  if (!count || totalDuration <= 0) {
+    return;
+  }
+  const viewPeakStart = (visibleStart / totalDuration) * count;
+  const viewPeakSpan = Math.max(1, (visibleDuration / totalDuration) * count);
+  drawWaveformShape(ctx, width, height, (x) => {
+    const xStart = viewPeakStart + (x / Math.max(1, width)) * viewPeakSpan;
+    const xEnd = viewPeakStart + ((x + 1) / Math.max(1, width)) * viewPeakSpan;
+    return getWaveformRangeAtIndices(level, xStart, xEnd);
+  }, {
+    fillStyle: 'rgba(43, 74, 203, 0.2)',
+    strokeStyle: 'rgba(43, 74, 203, 0.72)',
+    gain: 0.45,
+  });
+}
+
+function drawWaveform(ctx, width, height) {
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!peaks) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.28)';
+    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+    ctx.fillText('Load audio to show the waveform.', 16, height / 2);
+    ctx.restore();
+    return;
+  }
+  const duration = Math.max(getAudioDuration(), getProjectMaxTime());
+  const visibleStart = clamp(runtime.view.start, 0, duration);
+  const visibleDuration = clamp(runtime.view.duration, VIEW_MIN_DURATION, duration);
+  const basePeakCount = Math.min(peaks.min.length, peaks.max.length);
+  const visiblePeakSpan = Math.max(1, (visibleDuration / Math.max(EPSILON, duration)) * basePeakCount);
+  const visiblePeaksPerPixel = visiblePeakSpan / Math.max(1, width);
+
+  if (visiblePeaksPerPixel <= TIMELINE_WAVEFORM_DIRECT_MAX_PEAKS_PER_PIXEL) {
+    drawWaveformDirect(ctx, width, height, peaks, visibleStart, visibleDuration, duration);
+    return;
+  }
+
+  const config = getTimelineWaveformTileConfig(width, height, visibleDuration, duration);
+  const cacheKey = getTimelineWaveformTileCacheKey(height, duration);
+  const startTile = Math.max(0, Math.floor(visibleStart / config.tileDuration) - 1);
+  const endTile = Math.min(config.tileCount - 1, Math.ceil((visibleStart + visibleDuration) / config.tileDuration));
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, width, height);
+  ctx.clip();
+  ctx.imageSmoothingEnabled = false;
+
+  for (let tileIndex = startTile; tileIndex <= endTile; tileIndex += 1) {
+    const tile = getTimelineWaveformTile(cacheKey, tileIndex, config);
+    if (!tile) {
+      continue;
+    }
+    const overlapStart = Math.max(tile.start, visibleStart);
+    const overlapEnd = Math.min(tile.end, visibleStart + visibleDuration);
+    if (overlapEnd <= overlapStart) {
+      continue;
+    }
+    const tileDuration = Math.max(EPSILON, tile.end - tile.start);
+    const srcX = ((overlapStart - tile.start) / tileDuration) * tile.canvas.width;
+    const srcW = ((overlapEnd - overlapStart) / tileDuration) * tile.canvas.width;
+    const destX = ((overlapStart - visibleStart) / visibleDuration) * width;
+    const destW = ((overlapEnd - overlapStart) / visibleDuration) * width;
+    if (destX > width || destX + destW < 0 || srcW <= 0 || destW <= 0) {
+      continue;
+    }
+    ctx.drawImage(tile.canvas, srcX, 0, srcW, tile.canvas.height, destX, 0, destW, height);
+  }
+
+  ctx.restore();
 }
 
 function drawTimelineSelectionRange(ctx, width, height) {
@@ -1772,11 +2183,14 @@ function drawTimelineSelectionRange(ctx, width, height) {
   ctx.restore();
 }
 
-function drawTimelineBlocks(ctx, width, height) {
-  runtime.timelineHitboxes = [];
+function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {}) {
+  if (rebuildHitboxes) {
+    runtime.timelineHitboxes = [];
+  }
   const trackY = height - TIMELINE_TRACK_HEIGHT;
   const trackHeight = TIMELINE_TRACK_HEIGHT - 8;
   const selected = getSelectionEntry();
+  const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
     if (!isFiniteNumber(entry.syllable.start)) {
       return;
@@ -1794,7 +2208,7 @@ function drawTimelineBlocks(ctx, width, height) {
     const w = Math.max(3, x2 - x1);
     const y = trackY;
     const isSelected = selected?.id === entry.id;
-    const isSounding = getCurrentSoundingEntry()?.id === entry.id;
+    const isSounding = soundingEntry?.id === entry.id;
     ctx.save();
     ctx.fillStyle = isSelected ? 'rgba(184, 92, 0, 0.88)' : isSounding ? 'rgba(43, 74, 203, 0.82)' : 'rgba(20, 160, 100, 0.55)';
     ctx.strokeStyle = isSelected ? 'rgba(138, 66, 0, 0.92)' : isSounding ? 'rgba(25, 52, 153, 0.9)' : 'rgba(0,0,0,0.12)';
@@ -1813,38 +2227,42 @@ function drawTimelineBlocks(ctx, width, height) {
     }
     if (w > 20) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
       ctx.fillText(entry.syllable.text, x1 + 6, y + trackHeight / 2 + 4);
     }
     ctx.restore();
 
-    runtime.timelineHitboxes.push({
-      type: 'block',
-      syllableId: entry.id,
-      x: x1,
-      y,
-      w,
-      h: trackHeight,
-    });
+    if (rebuildHitboxes) {
+      runtime.timelineHitboxes.push({
+        type: 'block',
+        syllableId: entry.id,
+        x: x1,
+        y,
+        w,
+        h: trackHeight,
+      });
+    }
 
     if (isSelected) {
       const handleSize = 8 * (window.devicePixelRatio || 1);
-      runtime.timelineHitboxes.push({
-        type: 'start-handle',
-        syllableId: entry.id,
-        x: x1 - handleSize / 2,
-        y,
-        w: handleSize,
-        h: trackHeight,
-      });
-      runtime.timelineHitboxes.push({
-        type: 'end-handle',
-        syllableId: entry.id,
-        x: x2 - handleSize / 2,
-        y,
-        w: handleSize,
-        h: trackHeight,
-      });
+      if (rebuildHitboxes) {
+        runtime.timelineHitboxes.push({
+          type: 'start-handle',
+          syllableId: entry.id,
+          x: x1 - handleSize / 2,
+          y,
+          w: handleSize,
+          h: trackHeight,
+        });
+        runtime.timelineHitboxes.push({
+          type: 'end-handle',
+          syllableId: entry.id,
+          x: x2 - handleSize / 2,
+          y,
+          w: handleSize,
+          h: trackHeight,
+        });
+      }
       ctx.save();
       ctx.fillStyle = 'rgba(158, 108, 8, 0.95)';
       ctx.fillRect(x1 - 1, y - 1, 2, trackHeight + 2);
@@ -1889,32 +2307,21 @@ function drawPlayhead(ctx, width, height, { gutter = 0 } = {}) {
   ctx.restore();
 }
 
-function drawTimeline() {
+function drawTimeline({ rebuildHitboxes = true } = {}) {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.timelineCanvas);
   if (!ctx) return; // Exit if hidden
-  
-  drawBackground(ctx, width, height);
-  drawTimelineSelectionRange(ctx, width, height);
-  drawBeatGrid(ctx, width, height - TIMELINE_TRACK_HEIGHT, { alpha: 0.12 });
-  drawWaveform(ctx, width, height - TIMELINE_TRACK_HEIGHT);
-  drawTimelineBlocks(ctx, width, height);
+
+  drawTimelineBase(ctx, width, height);
+  drawTimelineBlocks(ctx, width, height, { rebuildHitboxes });
   drawPlayhead(ctx, width, height);
 }
 
 function drawOverview() {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.overviewCanvas);
   if (!ctx) return; // Exit if hidden
-  
-  drawBackground(ctx, width, height);
+
   const fullDuration = getProjectMaxTime();
-  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
-  if (peaks) {
-    drawWaveformShape(ctx, width, height, (x) => getWaveformRangeAtTime(peaks, (x / Math.max(1, width)) * fullDuration, fullDuration), {
-      fillStyle: 'rgba(43, 74, 203, 0.18)',
-      strokeStyle: 'rgba(43, 74, 203, 0.6)',
-      gain: 0.43,
-    });
-  }
+  drawOverviewBase(ctx, width, height, fullDuration);
   const viewportX = (runtime.view.start / fullDuration) * width;
   const viewportW = Math.max(12, (runtime.view.duration / fullDuration) * width);
   runtime.overviewViewportHitbox = {
@@ -1959,31 +2366,19 @@ function getGhostPitchForSelected() {
   return clamp(runtime.selectedPitchGhost || Math.round((state.settings.pitchRange.min + state.settings.pitchRange.max) / 2), 24, 108);
 }
 
-function drawPitchGuide() {
+function drawPitchGuide({ rebuildHitboxes = true } = {}) {
   const { ctx, width, height } = resizeCanvasToDisplaySize(els.pitchCanvas);
   if (!ctx) return; // Exit if hidden
 
-  drawBackground(ctx, width, height);
+  drawPitchBase(ctx, width, height);
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const rowCount = Math.max(1, maxPitch - minPitch + 1);
   const rowHeight = (height - 16) / rowCount;
   const selectedEntry = getSelectionEntry();
-  runtime.pitchHitboxes = [];
-
-  ctx.save();
-  for (let pitch = maxPitch; pitch >= minPitch; pitch -= 1) {
-    const y = pitchToY(pitch, minPitch, maxPitch, height);
-    const isBlack = [1, 3, 6, 8, 10].includes(((pitch % 12) + 12) % 12);
-    ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
-    ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
-    ctx.fillStyle = 'rgba(0,0,0,0.38)';
-    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
-    ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
+  if (rebuildHitboxes) {
+    runtime.pitchHitboxes = [];
   }
-  ctx.restore();
-
-  drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
 
   const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
@@ -1992,6 +2387,9 @@ function drawPitchGuide() {
     const hasPitch = isFiniteNumber(entry.syllable.pitch);
     const shouldShowGhost = selectedEntry?.id === entry.id && !hasPitch && isFiniteNumber(start) && isFiniteNumber(end);
     if (!isFiniteNumber(start) || !isFiniteNumber(end) || (!hasPitch && !shouldShowGhost)) {
+      return;
+    }
+    if (end < runtime.view.start || start > runtime.view.start + runtime.view.duration) {
       return;
     }
     const pitch = hasPitch ? entry.syllable.pitch : getGhostPitchForSelected();
@@ -2027,19 +2425,21 @@ function drawPitchGuide() {
     ctx.setLineDash([]);
     if (w > 28) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
       ctx.fillText(`${entry.syllable.text} · ${noteNameFromMidi(pitch)}`, x1 + 6, y + h * 0.66);
     }
     ctx.restore();
-    runtime.pitchHitboxes.push({
-      type: shouldShowGhost ? 'ghost-note' : 'note',
-      syllableId: entry.id,
-      x: x1,
-      y,
-      w,
-      h,
-      pitch,
-    });
+    if (rebuildHitboxes) {
+      runtime.pitchHitboxes.push({
+        type: shouldShowGhost ? 'ghost-note' : 'note',
+        syllableId: entry.id,
+        x: x1,
+        y,
+        w,
+        h,
+        pitch,
+      });
+    }
   });
 
   drawPlayhead(ctx, width, height, { gutter: PITCH_GUTTER });
@@ -3172,7 +3572,7 @@ function attachEventListeners() {
     els.metronomeVolumeLabel.textContent = formatPercent(state.settings.metronome.volume);
     ensureAudioContext(false).catch((error) => console.warn(error));
     resetAudioOverlayState();
-    markDirty();
+    invalidateRenderCaches('timeline', 'pitch');
     scheduleAutosave();
   };
   els.metronomeEnabled.addEventListener('change', metronomeListener);
@@ -3195,7 +3595,7 @@ function attachEventListeners() {
     state.settings.pitchRange.max = Math.max(minValue, maxValue);
     els.pitchMinInput.value = String(state.settings.pitchRange.min);
     els.pitchMaxInput.value = String(state.settings.pitchRange.max);
-    markDirty();
+    invalidateRenderCaches('pitch');
     scheduleAutosave();
   };
   els.pitchMinInput.addEventListener('change', pitchRangeListener);
@@ -3248,7 +3648,7 @@ function attachEventListeners() {
   }
 
   runtime.resizeObserver = new ResizeObserver(() => {
-    markDirty();
+    invalidateRenderCaches();
   });
   runtime.resizeObserver.observe(els.timelineCanvas);
   runtime.resizeObserver.observe(els.overviewCanvas);
@@ -3424,11 +3824,21 @@ function animate(ts) {
   updateTransportUi();
   updateLyricsDynamic();
   updateMediaSessionPosition();
-  if (runtime.drawDirty || !els.audioPlayer.paused || runtime.drag) {
-    drawTimeline();
+  const currentTime = getCurrentTime();
+  const isPlaying = !els.audioPlayer.paused;
+  const timeAdvanced = runtime.lastDrawnTime === null || Math.abs(currentTime - runtime.lastDrawnTime) > 1 / 240;
+  const needsInteractiveRedraw = Boolean(runtime.drawDirty || runtime.drag);
+  if (needsInteractiveRedraw) {
+    drawTimeline({ rebuildHitboxes: true });
     drawOverview();
-    drawPitchGuide();
+    drawPitchGuide({ rebuildHitboxes: true });
     runtime.drawDirty = false;
+    runtime.lastDrawnTime = currentTime;
+  } else if (isPlaying && timeAdvanced) {
+    drawTimeline({ rebuildHitboxes: false });
+    drawOverview();
+    drawPitchGuide({ rebuildHitboxes: false });
+    runtime.lastDrawnTime = currentTime;
   }
   requestAnimationFrame(animate);
 }
