@@ -636,27 +636,96 @@ async function ensureAudioContext(resume = false) {
   return runtime.audioContext;
 }
 
-function computeWaveformPeaks(audioBuffer, samples = 2600) {
+function computeWaveformPeaks(audioBuffer) {
   const channelCount = audioBuffer.numberOfChannels;
   const length = audioBuffer.length;
-  const blockSize = Math.max(1, Math.floor(length / samples));
-  const peaks = new Array(samples).fill(0);
-  for (let i = 0; i < samples; i += 1) {
+  const duration = Math.max(audioBuffer.duration || 0, 1);
+  const targetSamples = clamp(Math.round(duration * 120), 4000, 48000);
+  const blockSize = Math.max(1, Math.floor(length / targetSamples));
+  const actualSamples = Math.max(1, Math.ceil(length / blockSize));
+  const min = new Array(actualSamples).fill(0);
+  const max = new Array(actualSamples).fill(0);
+  for (let i = 0; i < actualSamples; i += 1) {
     const start = i * blockSize;
     const end = Math.min(start + blockSize, length);
-    let peak = 0;
+    let blockMin = 1;
+    let blockMax = -1;
     for (let channel = 0; channel < channelCount; channel += 1) {
       const data = audioBuffer.getChannelData(channel);
       for (let j = start; j < end; j += 1) {
-        const value = Math.abs(data[j]);
-        if (value > peak) {
-          peak = value;
+        const value = data[j];
+        if (value < blockMin) {
+          blockMin = value;
+        }
+        if (value > blockMax) {
+          blockMax = value;
         }
       }
     }
-    peaks[i] = peak;
+    min[i] = blockMin === 1 ? 0 : blockMin;
+    max[i] = blockMax === -1 ? 0 : blockMax;
   }
-  return peaks;
+  return { min, max };
+}
+
+function normalizeWaveformPeaks(peaks) {
+  if (!peaks) {
+    return null;
+  }
+  if (Array.isArray(peaks)) {
+    const max = peaks.map((value) => Math.max(0, value || 0));
+    const min = max.map((value) => -value);
+    return { min, max };
+  }
+  if (Array.isArray(peaks.min) && Array.isArray(peaks.max) && peaks.min.length && peaks.max.length) {
+    return peaks;
+  }
+  return null;
+}
+
+function getWaveformRangeAtTime(peaks, time, duration) {
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  if (!count || duration <= 0) {
+    return { min: 0, max: 0 };
+  }
+  const index = clamp(Math.floor((time / duration) * count), 0, count - 1);
+  return {
+    min: peaks.min[index] || 0,
+    max: peaks.max[index] || 0,
+  };
+}
+
+function drawWaveformShape(ctx, width, height, sampleAtX, { fillStyle, strokeStyle, gain = 0.46 } = {}) {
+  const upper = [];
+  const lower = [];
+  const mid = height / 2;
+  const amplitudeScale = height * gain;
+  for (let x = 0; x < width; x += 1) {
+    const range = sampleAtX(x);
+    const top = mid - Math.max(0, range.max) * amplitudeScale;
+    const bottom = mid - Math.min(0, range.min) * amplitudeScale;
+    upper.push([x, top]);
+    lower.push([x, bottom]);
+  }
+  if (!upper.length) {
+    return;
+  }
+  ctx.save();
+  ctx.fillStyle = fillStyle || 'rgba(43, 74, 203, 0.26)';
+  ctx.strokeStyle = strokeStyle || 'rgba(43, 74, 203, 0.72)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(upper[0][0], upper[0][1]);
+  for (let i = 1; i < upper.length; i += 1) {
+    ctx.lineTo(upper[i][0], upper[i][1]);
+  }
+  for (let i = lower.length - 1; i >= 0; i -= 1) {
+    ctx.lineTo(lower[i][0], lower[i][1]);
+  }
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
 }
 
 async function loadAudioBlob(blob, { preservePlaybackPosition = false } = {}) {
@@ -1670,8 +1739,8 @@ function drawBeatGrid(ctx, width, height, { gutter = 0, alpha = 0.18 } = {}) {
 }
 
 function drawWaveform(ctx, width, height) {
-  const peaks = state.waveformPeaks || [];
-  if (!peaks.length) {
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!peaks) {
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
     ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getComputedStyle(document.body).fontFamily}`;
@@ -1680,21 +1749,14 @@ function drawWaveform(ctx, width, height) {
     return;
   }
   const duration = Math.max(getAudioDuration(), getProjectMaxTime());
-  const mid = height / 2;
-  ctx.save();
-  ctx.strokeStyle = 'rgba(30, 90, 200, 0.55)';
-  ctx.lineWidth = 1;
-  for (let x = 0; x < width; x += 1) {
+  drawWaveformShape(ctx, width, height, (x) => {
     const time = xToTime(x, width, 0);
-    const peakIndex = clamp(Math.floor((time / duration) * peaks.length), 0, peaks.length - 1);
-    const peak = peaks[peakIndex] || 0;
-    const amplitude = peak * (height * 0.46);
-    ctx.beginPath();
-    ctx.moveTo(x + 0.5, mid - amplitude);
-    ctx.lineTo(x + 0.5, mid + amplitude);
-    ctx.stroke();
-  }
-  ctx.restore();
+    return getWaveformRangeAtTime(peaks, time, duration);
+  }, {
+    fillStyle: 'rgba(43, 74, 203, 0.2)',
+    strokeStyle: 'rgba(43, 74, 203, 0.72)',
+    gain: 0.45,
+  });
 }
 
 function drawTimelineSelectionRange(ctx, width, height) {
@@ -1845,22 +1907,13 @@ function drawOverview() {
   
   drawBackground(ctx, width, height);
   const fullDuration = getProjectMaxTime();
-  const peaks = state.waveformPeaks ||[];
-  if (peaks.length) {
-    const mid = height / 2;
-    ctx.save();
-    ctx.strokeStyle = 'rgba(30, 90, 200, 0.55)';
-    ctx.lineWidth = 1;
-    for (let x = 0; x < width; x += 1) {
-      const peakIndex = clamp(Math.floor((x / width) * peaks.length), 0, peaks.length - 1);
-      const peak = peaks[peakIndex] || 0;
-      const amplitude = peak * (height * 0.44);
-      ctx.beginPath();
-      ctx.moveTo(x + 0.5, mid - amplitude);
-      ctx.lineTo(x + 0.5, mid + amplitude);
-      ctx.stroke();
-    }
-    ctx.restore();
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (peaks) {
+    drawWaveformShape(ctx, width, height, (x) => getWaveformRangeAtTime(peaks, (x / Math.max(1, width)) * fullDuration, fullDuration), {
+      fillStyle: 'rgba(43, 74, 203, 0.18)',
+      strokeStyle: 'rgba(43, 74, 203, 0.6)',
+      gain: 0.43,
+    });
   }
   const viewportX = (runtime.view.start / fullDuration) * width;
   const viewportW = Math.max(12, (runtime.view.duration / fullDuration) * width);
