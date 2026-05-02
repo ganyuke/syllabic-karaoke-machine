@@ -16,6 +16,9 @@ const LATIN_RE = /^[A-Za-z]+$/;
 const SECTION_LABEL_RE = /^\s*\[[^\]]+\]\s*$/;
 const EDGE_PUNCT_RE = /^[\s"'“”‘’.,!?！？。、・･:;()\[\]{}「」『』【】〈〉《》]+|[\s"'“”‘’.,!?！？。、・･:;()\[\]{}「」『』【】〈〉《》]+$/g;
 const SMALL_KANA_RE = /[ゃゅょャュョぁぃぅぇぉァィゥェォゎヮゕゖ]/;
+// hardcode canvas fonts so JS doesn't try probe the full computed CSS fallback list on redraw.
+// should fix all the font warnings on Firefox wth resistFingerprinting enabled
+const CANVAS_FONT_FAMILY = '"Geist", sans-serif';
 
 const DEFAULT_KEYBINDS = {
   tapTiming: ['enter', 'k', 'z', 'x'],
@@ -210,7 +213,6 @@ const runtime = {
     lastCompletedTimedIndex: -1,
   },
   renderCache: {
-    fontFamily: '',
     timelineBase: { canvas: null, key: '' },
     overviewBase: { canvas: null, key: '' },
     pitchBase: { canvas: null, key: '' },
@@ -702,13 +704,6 @@ function upperBound(sortedValues, target) {
   return low;
 }
 
-function getUiFontFamily() {
-  if (!runtime.renderCache.fontFamily) {
-    runtime.renderCache.fontFamily = getComputedStyle(document.body).fontFamily;
-  }
-  return runtime.renderCache.fontFamily;
-}
-
 function invalidateRenderCaches(...keys) {
   if (!keys.length || keys.includes('timeline')) {
     runtime.renderCache.timelineBase.key = '';
@@ -863,16 +858,35 @@ function getProjectMaxTime() {
   return Math.max(FULL_VIEW_MIN, runtime.index.maxTime || getAudioDuration() || FULL_VIEW_MIN);
 }
 
+function createRuntimeAudioMeta(audioMeta = {}) {
+  return {
+    name: audioMeta.name || '',
+    type: audioMeta.type || '',
+    size: isFiniteNumber(audioMeta.size) ? Number(audioMeta.size) : 0,
+    // Duration is derived from the decoded AudioBuffer/current media element.
+    // Keep it in runtime state for UI only; never trust or persist it.
+    duration: 0,
+  };
+}
+
+function createPersistableAudioMeta(audioMeta = {}) {
+  return {
+    name: audioMeta.name || '',
+    type: audioMeta.type || '',
+    size: isFiniteNumber(audioMeta.size) ? Number(audioMeta.size) : 0,
+  };
+}
+
 function mergeStateDefaults(project) {
   const base = defaultState();
   const incoming = project || {};
   return {
     ...base,
     ...incoming,
-    audioMeta: {
+    audioMeta: createRuntimeAudioMeta({
       ...base.audioMeta,
       ...(incoming.audioMeta || {}),
-    },
+    }),
     settings: {
       ...base.settings,
       ...(incoming.settings || {}),
@@ -929,7 +943,7 @@ function normalizeStructure(structure = []) {
   }));
 }
 
-function serializeProject({ includeDerived = false } = {}) {
+function serializeProject() {
   return {
     appId: APP_ID,
     version: APP_VERSION,
@@ -938,11 +952,11 @@ function serializeProject({ includeDerived = false } = {}) {
       currentTime: getCurrentTime(),
       wasPlaying: getIsPlaying(),
     },
-    project: createSerializableProjectState({ includeDerived }),
+    project: createSerializableProjectState(),
   };
 }
 
-function createSerializableProjectState({ includeDerived = false } = {}) {
+function createSerializableProjectState() {
   const project = {
     projectName: state.projectName,
     lyricsMarkup: state.lyricsMarkup,
@@ -963,14 +977,14 @@ function createSerializableProjectState({ includeDerived = false } = {}) {
         })),
       })),
     })),
-    audioMeta: { ...state.audioMeta },
+    audioMeta: createPersistableAudioMeta(state.audioMeta),
     settings: deepClone(state.settings),
     selection: { ...state.selection },
     practiceTarget: { ...state.practiceTarget },
   };
-  if (includeDerived) {
-    project.waveformPeaks = state.waveformPeaks;
-  }
+  // Derived decode/waveform data is intentionally excluded. It is rebuilt
+  // from the stored/restored audio blob on load so autosave/export only contain
+  // cold-start source data.
   return project;
 }
 
@@ -1002,19 +1016,44 @@ async function openDb() {
   });
 }
 
-async function putAutosaveState() {
-  if (runtime.loadingProject) {
+function createAutosaveAudioRecord(blob, savedAt = Date.now()) {
+  if (!blob) {
+    return null;
+  }
+  return {
+    id: AUTOSAVE_AUDIO_KEY,
+    savedAt,
+    audioBlob: blob,
+    name: blob.name || state.audioMeta.name || '',
+    type: blob.type || state.audioMeta.type || 'audio/*',
+    size: blob.size || 0,
+  };
+}
+
+async function putAutosaveSnapshot({ audioAction = 'keep', audio = audioBlob } = {}) {
+  if (runtime.loadingProject && audioAction !== 'replace') {
     return;
   }
   const db = await openDb();
-  const payload = {
+  const savedAt = Date.now();
+  const statePayload = {
     id: AUTOSAVE_STATE_KEY,
-    savedAt: Date.now(),
+    savedAt,
     project: serializeProject(),
   };
+  const audioPayload = audioAction === 'replace' ? createAutosaveAudioRecord(audio, savedAt) : null;
+
   await new Promise((resolve, reject) => {
     const tx = db.transaction(DB_STORE, 'readwrite');
-    tx.objectStore(DB_STORE).put(payload);
+    const store = tx.objectStore(DB_STORE);
+    store.put(statePayload);
+    if (audioAction === 'replace') {
+      if (audioPayload) {
+        store.put(audioPayload);
+      } else {
+        store.delete(AUTOSAVE_AUDIO_KEY);
+      }
+    }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
     tx.onabort = () => reject(tx.error);
@@ -1022,33 +1061,12 @@ async function putAutosaveState() {
   updateSaveStatus(`Autosaved locally at ${new Date().toLocaleTimeString()}.`);
 }
 
-async function putAutosaveAudio(blob) {
-  const db = await openDb();
-  if (!blob) {
-    // Remove any stale audio record
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(DB_STORE, 'readwrite');
-      tx.objectStore(DB_STORE).delete(AUTOSAVE_AUDIO_KEY);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () => reject(tx.error);
-    });
-    return;
-  }
-  const payload = {
-    id: AUTOSAVE_AUDIO_KEY,
-    savedAt: Date.now(),
-    audioBlob: blob,
-    name: blob.name || '',
-    type: blob.type || 'audio/*',
-  };
-  await new Promise((resolve, reject) => {
-    const tx = db.transaction(DB_STORE, 'readwrite');
-    tx.objectStore(DB_STORE).put(payload);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-    tx.onabort = () => reject(tx.error);
-  });
+async function putAutosaveState() {
+  await putAutosaveSnapshot();
+}
+
+async function replaceAutosaveAudio(blob) {
+  await putAutosaveSnapshot({ audioAction: 'replace', audio: blob });
 }
 
 function scheduleAutosave() {
@@ -1092,15 +1110,28 @@ async function loadAutosave() {
     let safeAudioBlob = null;
     if (audioRecord?.audioBlob) {
       safeAudioBlob = await validateBlob(audioRecord.audioBlob);
-      const expectedSize = Number(stateRecord.project?.project?.audioMeta?.size || stateRecord.project?.audioMeta?.size || 0);
+      const projectState = stateRecord.project?.project || stateRecord.project;
+      const expectedSize = Number(projectState?.audioMeta?.size || 0);
       if (safeAudioBlob && expectedSize > 0 && safeAudioBlob.size !== expectedSize) {
-        console.warn('Ignoring autosaved audio blob with unexpected size.', { expectedSize, actualSize: safeAudioBlob.size });
-        safeAudioBlob = null;
+        const audioLooksNewer = Number(audioRecord?.savedAt || 0) >= Number(stateRecord.savedAt || 0);
+        if (audioLooksNewer && projectState?.audioMeta) {
+          console.warn('Repairing autosave audio metadata from newer audio blob.', { expectedSize, actualSize: safeAudioBlob.size });
+          projectState.audioMeta = {
+            ...projectState.audioMeta,
+            name: audioRecord?.name || projectState.audioMeta.name || '',
+            type: audioRecord?.type || projectState.audioMeta.type || safeAudioBlob.type || 'audio/*',
+            size: safeAudioBlob.size,
+          };
+        } else {
+          console.warn('Ignoring autosaved audio blob with unexpected size.', { expectedSize, actualSize: safeAudioBlob.size });
+          safeAudioBlob = null;
+        }
       }
       if (safeAudioBlob) {
+        const projectState = stateRecord.project?.project || stateRecord.project;
         safeAudioBlob = await reviveStoredAudioBlob(safeAudioBlob, {
-          name: audioRecord?.name || stateRecord.project?.project?.audioMeta?.name || stateRecord.project?.audioMeta?.name || '',
-          type: audioRecord?.type || stateRecord.project?.project?.audioMeta?.type || stateRecord.project?.audioMeta?.type || safeAudioBlob.type || 'audio/*',
+          name: audioRecord?.name || projectState?.audioMeta?.name || '',
+          type: audioRecord?.type || projectState?.audioMeta?.type || safeAudioBlob.type || 'audio/*',
         });
       }
     }
@@ -1519,12 +1550,7 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
       URL.revokeObjectURL(runtime.artworkObjectUrl);
       runtime.artworkObjectUrl = '';
     }
-    state.audioMeta = {
-      name: '',
-      type: '',
-      size: 0,
-      duration: 0,
-    };
+    state.audioMeta = createRuntimeAudioMeta();
     state.waveformPeaks = [];
     runtime.transport.buffer = null;
     runtime.renderCache.waveformVersion += 1;
@@ -1541,9 +1567,13 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
     resetAudioOverlayState();
     updateMediaSession();
     document.title = 'Syllable Karaoke Studio';
-    // Clear the stored audio blob since there's no audio anymore
-    putAutosaveAudio(null).catch(console.error);
-    scheduleAutosave();
+    // Clear the stored audio blob and save the matching empty audio metadata in one transaction.
+    try {
+      await replaceAutosaveAudio(null);
+    } catch (error) {
+      console.error('Audio autosave replacement failed:', error);
+      updateSaveStatus('Autosave failed.');
+    }
     return;
   }
 
@@ -1562,15 +1592,23 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
   els.audioPlayer.volume = state.settings.musicVolume;
   els.audioPlayer.load();
 
-  state.audioMeta = {
+  state.audioMeta = createRuntimeAudioMeta({
     name: blob.name || state.audioMeta.name || 'audio-file',
     type: blob.type || state.audioMeta.type || 'audio/*',
     size: blob.size || state.audioMeta.size || 0,
-    duration: state.audioMeta.duration || 0,
-  };
+  });
 
   setTransportPausedTime(seekTime);
   refreshAudioMeta();
+
+  let autosaveAudioReplaced = false;
+  try {
+    await replaceAutosaveAudio(blob);
+    autosaveAudioReplaced = true;
+  } catch (error) {
+    console.error('Audio autosave replacement failed:', error);
+    updateSaveStatus('Autosave failed.');
+  }
 
   // Wait for metadata so duration is available, then restore position.
   // On Firefox, using a restored Blob too early can transiently report a bad
@@ -1635,11 +1673,15 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
   resetAudioOverlayState();
   markDirty();
 
-  // Save audio blob separately — only on actual audio change, not on every timing edit
-  putAutosaveAudio(blob).catch((error) => {
-    console.error('Audio autosave failed:', error);
-  });
-  scheduleAutosave();
+  if (!autosaveAudioReplaced) {
+    // Retry as a full replacement so audioMeta and the audio blob still land atomically.
+    try {
+      await replaceAutosaveAudio(blob);
+    } catch (error) {
+      console.error('Audio autosave replacement failed:', error);
+      updateSaveStatus('Autosave failed.');
+    }
+  }
 }
 
 function getFlattenedTimingSnapshot(previousStructure = []) {
@@ -2845,7 +2887,7 @@ function renderPitchBase(ctx, width, height) {
     ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
     ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
     ctx.fillStyle = 'rgba(0,0,0,0.38)';
-    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
     ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
   }
   ctx.restore();
@@ -2989,7 +3031,7 @@ function drawWaveform(ctx, width, height) {
   if (!peaks) {
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
     ctx.fillText('Load audio to show the waveform.', 16, height / 2);
     ctx.restore();
     return;
@@ -3098,7 +3140,7 @@ function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {})
     }
     if (w > 20) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
       ctx.fillText(entry.syllable.text, x1 + 6, y + trackHeight / 2 + 4);
     }
     ctx.restore();
@@ -3296,7 +3338,7 @@ function drawPitchGuide({ rebuildHitboxes = true } = {}) {
     ctx.setLineDash([]);
     if (w > 28) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${getUiFontFamily()}`;
+      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
       ctx.fillText(`${entry.syllable.text} · ${noteNameFromMidi(pitch)}`, x1 + 6, y + h * 0.66);
     }
     ctx.restore();
