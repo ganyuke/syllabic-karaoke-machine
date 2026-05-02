@@ -2,6 +2,10 @@
 
 A local-first browser app for syncing lyrics to audio, down to the syllable.
 
+Try it out here: https://ganyuke.github.io/syllabic-karaoke-machine/
+
+You can listen to a cool demo that I spent an hour or two timing by opening up the dropdown beside the "Import" butotn at the top.
+
 ## Features
 
 - A waveform for scrubbing through and visualizing syllable placement across the song.
@@ -11,7 +15,7 @@ A local-first browser app for syncing lyrics to audio, down to the syllable.
 
 ## Running it
 
-You can open `index.html` in a browser. Or access the version hosted on Github Pages.
+You can open `index.html` in a browser. Or access the version hosted on [Github Pages](https://ganyuke.github.io/syllabic-karaoke-machine/).
 
 ## Workflow
 
