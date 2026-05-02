@@ -8,7 +8,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500&family=Geist:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
-  <link rel="icon" href="icon.ico" type="image/x-icon"></head>
+  <link rel="icon" href="icon.ico" type="image/x-icon" />
+</head>
 <body>
 
   <header class="topbar">
@@ -21,66 +22,73 @@
         <input id="projectName" type="text" placeholder="Untitled project" />
       </label>
       <div class="topbar-actions">
-        <label class="btn btn-ghost file-btn" title="Load audio file">
+        <label class="btn btn-ghost file-btn" title="Load an audio file into the project">
           Audio
           <input id="audioFileInput" type="file" accept="audio/*" tabindex="-1" />
         </label>
-        <label class="btn btn-ghost file-btn" title="Import project JSON">
-          Import
-          <input id="importProjectInput" type="file" accept="application/json,.json" tabindex="-1" />
-        </label>
-        <button id="exportProjectBtn" class="btn btn-ink"   title="Export project to JSON">Export</button>
-        <button id="clearProjectBtn"  class="btn btn-ghost" title="Reset project">Reset</button>
-        <label class="check-pair" title="Embed audio data inside export">
+
+        <div id="importProjectSplit" class="split-btn">
+          <button id="importProjectBtn" class="btn btn-ghost split-btn__main" type="button" title="Import a project JSON file">Import</button>
+          <input id="importProjectInput" type="file" accept="application/json,.json" tabindex="-1" hidden />
+          <button id="importProjectMenuBtn" class="btn btn-ghost split-btn__toggle" type="button" aria-haspopup="menu" aria-expanded="false" title="Show import options">
+            <span aria-hidden="true">▾</span>
+          </button>
+          <div id="importProjectMenu" class="split-btn__menu" role="menu" hidden>
+            <button id="importDemoProjectBtn" class="btn btn-ghost btn-xs split-btn__menu-item" type="button" role="menuitem">Import demo</button>
+          </div>
+        </div>
+
+        <button id="exportProjectBtn" class="btn btn-ink" title="Export the current project to JSON">Export</button>
+        <button id="clearProjectBtn" class="btn btn-ghost" title="Reset the current project">Reset</button>
+        <label class="check-pair" title="Include the loaded audio file inside exported JSON">
           <input id="embedAudioInExport" type="checkbox" checked />
           <span>Embed audio</span>
         </label>
       </div>
     </div>
     <div class="topbar-status">
-      <span id="audioFileName"      class="tag tag--file">No audio</span>
+      <span id="audioFileName" class="tag tag--file">No audio</span>
       <span id="audioDurationLabel" class="tag tag--mono">0:00</span>
-      <span id="keyboardModePill"   class="tag tag--mode">Timing keys</span>
-      <span id="saveStatus"         class="save-status">Nothing saved yet.</span>
+      <span id="keyboardModePill" class="tag tag--mode">Timing keys</span>
+      <span id="saveStatus" class="save-status">Nothing saved yet.</span>
     </div>
     <audio id="audioPlayer" preload="metadata"></audio>
   </header>
 
   <div class="transport">
     <div class="t-group">
-      <button id="playPauseBtn"    class="btn btn-play" title="Play / Pause (Space)">Play</button>
-      <button id="rewindBtn"       class="btn btn-ghost btn-sm mono-btn" title="Seek back (J)">−2s</button>
-      <button id="forwardBtn"      class="btn btn-ghost btn-sm mono-btn" title="Seek forward (L)">+2s</button>
+      <button id="playPauseBtn" class="btn btn-play" title="Start or pause playback">Play</button>
+      <button id="rewindBtn" class="btn btn-ghost btn-sm mono-btn" title="Move the playhead backward by the seek step">−2s</button>
+      <button id="forwardBtn" class="btn btn-ghost btn-sm mono-btn" title="Move the playhead forward by the seek step">+2s</button>
     </div>
     <div class="t-div"></div>
     <div class="t-group">
-      <button id="prevSyllableBtn" class="btn btn-ghost btn-sm" title="Previous syllable ([ or ArrowLeft)">← Prev</button>
-      <button id="nextSyllableBtn" class="btn btn-ghost btn-sm" title="Next syllable (] or ArrowRight)">Next →</button>
+      <button id="prevSyllableBtn" class="btn btn-ghost btn-sm" title="Select the previous syllable">← Prev</button>
+      <button id="nextSyllableBtn" class="btn btn-ghost btn-sm" title="Select the next syllable">Next →</button>
     </div>
     <div class="t-div"></div>
     <div class="t-group">
-      <button id="setStartBtn"        class="btn btn-teal  btn-sm" title="Set start to playhead (S)">Set start</button>
-      <button id="setEndBtn"          class="btn btn-teal  btn-sm" title="Set end to playhead (E)">Set end</button>
-      <button id="tapFromSelectedBtn" class="btn btn-ink   btn-sm" title="Tap start and advance (Enter / K)">Tap → next</button>
-      <button id="jumpToSelectionBtn" class="btn btn-amber btn-sm" title="Jump to selected target">Jump</button>
-      <button id="loopSelectionBtn"   class="btn btn-ghost btn-sm" title="Toggle loop on selection">Loop off</button>
+      <button id="setStartBtn" class="btn btn-teal btn-sm" title="Set the selected syllable start at the playhead">Set start</button>
+      <button id="setEndBtn" class="btn btn-teal btn-sm" title="Set the selected syllable end at the playhead">Set end</button>
+      <button id="tapFromSelectedBtn" class="btn btn-ink btn-sm" title="Tap the current syllable start and advance to the next syllable">Tap → next</button>
+      <button id="jumpToSelectionBtn" class="btn btn-amber btn-sm" title="Jump to the current practice target">Jump</button>
+      <button id="loopSelectionBtn" class="btn btn-ghost btn-sm" title="Loop the current practice target">Loop off</button>
     </div>
     <div class="t-div"></div>
     <div class="t-group t-group--extras">
-      <button id="undoBtn"                class="btn btn-ghost btn-sm" title="Undo (Ctrl+Z)">Undo</button>
-      <button id="clearSelectedTimeBtn"   class="btn btn-ghost btn-sm btn-red-hover" title="Clear timing (Delete)">Clear timing</button>
-      <button id="clearFollowingTimesBtn" class="btn btn-ghost btn-sm btn-red-hover" title="Clear from here forward (Shift+Backspace)">Clear → end</button>
-      <button id="clearSelectedPitchBtn"  class="btn btn-ghost btn-sm btn-red-hover" title="Clear pitch (Backspace in pitch mode)">Clear pitch</button>
+      <button id="undoBtn" class="btn btn-ghost btn-sm" title="Undo the last timing or pitch change">Undo</button>
+      <button id="clearSelectedTimeBtn" class="btn btn-ghost btn-sm btn-red-hover" title="Clear the selected syllable timing">Clear timing</button>
+      <button id="clearFollowingTimesBtn" class="btn btn-ghost btn-sm btn-red-hover" title="Clear timing from the selected syllable to the end">Clear → end</button>
+      <button id="clearSelectedPitchBtn" class="btn btn-ghost btn-sm btn-red-hover" title="Clear the selected syllable pitch">Clear pitch</button>
     </div>
     <div class="t-scrub">
-      <span id="currentTimeLabel"   class="time-chip">0:00.00</span>
+      <span id="currentTimeLabel" class="time-chip">0:00.00</span>
       <input id="scrubInput" type="range" class="scrubber" min="0" max="1" step="0.001" value="0" />
       <span id="remainingTimeLabel" class="time-chip time-chip--dim">−0:00.00</span>
     </div>
   </div>
 
   <div class="workspace">
-
     <aside class="sidebar">
       <div class="sidebar-resize" title="Drag to resize"></div>
 
@@ -88,12 +96,11 @@
         <span id="selectedSummary" class="sel-badge__text">Nothing selected</span>
       </div>
 
-      <details class="panel" open>
+      <details class="panel" data-panel-id="lyrics-source" open>
         <summary class="panel__hd">
           <span class="panel__title">Lyrics source</span>
           <span class="panel__hd-right" onclick="event.stopPropagation()">
-            <button id="buildLyricsBtn"  class="btn btn-ink   btn-xs">Build</button>
-            <button id="sampleLyricsBtn" class="btn btn-ghost btn-xs">Demo</button>
+            <button id="buildLyricsBtn" class="btn btn-ink btn-xs" title="Build editable lyrics from the source text">Build</button>
           </span>
           <span class="panel__arrow">▾</span>
         </summary>
@@ -102,18 +109,18 @@
 Manual: ka-ra-o-ke ga su-ki
 
 Auto-JP: カラオケが好き"></textarea>
-          <label class="field-stacked">
+          <label class="field-stacked" title="Choose how the source text is split into syllables">
             <span class="field-label">Split mode</span>
             <select id="splitModeSelect">
               <option value="manual">Manual markup</option>
               <option value="auto-japanese">Auto Japanese</option>
             </select>
           </label>
-          <label class="check-pair">
+          <label class="check-pair" title="Skip empty lines when building lyrics">
             <input id="excludeDoubleNewlines" type="checkbox" checked />
             <span>Ignore blank lines</span>
           </label>
-          <label class="check-pair">
+          <label class="check-pair" title="Skip bracketed section labels when building lyrics">
             <input id="excludeSectionLabels" type="checkbox" checked />
             <span>Ignore [Section] labels</span>
           </label>
@@ -121,42 +128,36 @@ Auto-JP: カラオケが好き"></textarea>
         </div>
       </details>
 
-      <details class="panel" open>
+      <details class="panel" data-panel-id="selected-syllable" open>
         <summary class="panel__hd">
           <span class="panel__title">Selected syllable</span>
-          <span class="panel__hd-right" onclick="event.stopPropagation()">
-            <button id="jumpSelectedMiniBtn"  class="btn btn-amber btn-xs">Jump</button>
-            <button id="copyPlayheadStartBtn" class="btn btn-ghost btn-xs">→ start</button>
-            <button id="copyPlayheadEndBtn"   class="btn btn-ghost btn-xs">→ end</button>
-          </span>
           <span class="panel__arrow">▾</span>
         </summary>
         <div class="panel__body">
           <p id="selectedSummaryDetail" class="sel-detail">Nothing selected</p>
           <div class="timing-trio">
-            <label class="timing-cell">
+            <label class="timing-cell" title="Start time for the selected syllable, in seconds">
               <span class="timing-cell__lbl">Start (s)</span>
               <input id="selectedStartInput" type="number" min="0" step="0.01" placeholder="0.000" />
             </label>
-            <label class="timing-cell">
+            <label class="timing-cell" title="End time for the selected syllable, in seconds. Leave blank for auto.">
               <span class="timing-cell__lbl">End (s)</span>
               <input id="selectedEndInput" type="number" min="0" step="0.01" placeholder="auto" />
             </label>
-            <label class="timing-cell">
+            <label class="timing-cell" title="Guide pitch for the selected syllable as a MIDI note number">
               <span class="timing-cell__lbl">Pitch &nbsp;<span id="selectedPitchLabel" class="pitch-note">—</span></span>
               <input id="selectedPitchInput" type="number" min="24" max="108" step="1" placeholder="60" />
             </label>
           </div>
           <div class="btn-row">
-            <button id="applySelectedValuesBtn" class="btn btn-ghost btn-xs">Apply typed</button>
-            <button id="clearSelectedEndBtn"    class="btn btn-ghost btn-xs">Use next for end</button>
+            <button id="clearSelectedEndBtn" class="btn btn-ghost btn-xs" title="Clear the explicit end and use the next start instead">Use next for end</button>
           </div>
           <div class="nudge-strip">
             <span class="nudge-strip__lbl">Nudge</span>
-            <button id="nudgeBackLargeBtn"    class="btn btn-ghost btn-xs">−4×</button>
-            <button id="nudgeBackBtn"         class="btn btn-ghost btn-xs">−1×</button>
-            <button id="nudgeForwardBtn"      class="btn btn-ghost btn-xs">+1×</button>
-            <button id="nudgeForwardLargeBtn" class="btn btn-ghost btn-xs">+4×</button>
+            <button id="nudgeBackLargeBtn" class="btn btn-ghost btn-xs" title="Move the selected syllable start backward by four nudge steps">−4×</button>
+            <button id="nudgeBackBtn" class="btn btn-ghost btn-xs" title="Move the selected syllable start backward by one nudge step">−1×</button>
+            <button id="nudgeForwardBtn" class="btn btn-ghost btn-xs" title="Move the selected syllable start forward by one nudge step">+1×</button>
+            <button id="nudgeForwardLargeBtn" class="btn btn-ghost btn-xs" title="Move the selected syllable start forward by four nudge steps">+4×</button>
           </div>
           <div class="check-pair-row">
             <label class="check-pair" title="Selection always follows the sounding syllable">
@@ -168,91 +169,90 @@ Auto-JP: カラオケが好き"></textarea>
               <span>Select without seek</span>
             </label>
           </div>
-          <p class="hint">Space play · Enter/K tap→next · S/E set start/end · A select sounding · G jump to selected start · ←/[ and →/] select prev/next · ,/. nudge start · J/L seek · ↑↓ pitch · Delete clear timing · Backspace clear · Shift+Backspace clear following · Ctrl/Cmd+Z undo</p>
         </div>
       </details>
 
-      <details class="panel">
+      <details class="panel" data-panel-id="playback" open>
         <summary class="panel__hd">
           <span class="panel__title">Playback</span>
           <span class="panel__arrow">▾</span>
         </summary>
         <div class="panel__body">
-          <div class="slider-row">
+          <div class="slider-row" title="Playback speed">
             <span class="slider-row__lbl">Rate</span>
             <input id="playbackRateInput" type="range" min="0.4" max="1.25" step="0.05" value="0.8" />
             <span id="playbackRateLabel" class="slider-row__val">0.80×</span>
           </div>
-          <div class="slider-row">
+          <div class="slider-row" title="Lead-in before jump playback">
             <span class="slider-row__lbl">Pre-roll</span>
             <input id="preRollInput" type="range" min="0" max="1.2" step="0.02" value="0.18" />
             <span id="preRollLabel" class="slider-row__val">180ms</span>
           </div>
-          <div class="slider-row">
+          <div class="slider-row" title="Extra tail kept after loops">
             <span class="slider-row__lbl">Loop tail</span>
             <input id="postRollInput" type="range" min="0" max="1.2" step="0.02" value="0.08" />
             <span id="postRollLabel" class="slider-row__val">80ms</span>
           </div>
-          <div class="slider-row">
+          <div class="slider-row" title="Song volume">
             <span class="slider-row__lbl">Music</span>
             <input id="musicVolumeInput" type="range" min="0" max="1" step="0.01" value="1" />
             <span id="musicVolumeLabel" class="slider-row__val">100%</span>
           </div>
-          <div class="slider-row">
+          <div class="slider-row" title="Guide synth volume">
             <span class="slider-row__lbl">Guide</span>
             <input id="guideVolumeInput" type="range" min="0" max="1" step="0.01" value="0.25" />
             <span id="guideVolumeLabel" class="slider-row__val">25%</span>
           </div>
           <div class="two-col">
-            <label class="field-stacked">
+            <label class="field-stacked" title="How far rewind and forward move the playhead">
               <span class="field-label">Seek step (s)</span>
               <input id="seekStepInput" type="number" min="0.1" max="30" step="0.1" value="2" />
             </label>
-            <label class="field-stacked">
+            <label class="field-stacked" title="Start nudge amount used by the timing nudge buttons and keys">
               <span class="field-label">Nudge (ms)</span>
               <input id="nudgeStepInput" type="number" min="1" max="500" step="1" value="25" />
             </label>
           </div>
-          <label class="check-pair">
+          <label class="check-pair" title="Start playback automatically after jumping">
             <input id="autoPlayOnJump" type="checkbox" checked />
             <span>Auto-play on jump</span>
           </label>
-          <label class="check-pair">
+          <label class="check-pair" title="Keep the selected lyrics line visible during playback">
             <input id="autoScrollLyrics" type="checkbox" checked />
             <span>Auto-scroll lyrics</span>
           </label>
-          <label class="check-pair">
+          <label class="check-pair" title="Pan the waveform window when the playhead reaches the right edge">
             <input id="autoScrollWindow" type="checkbox" />
             <span>Auto-scroll window</span>
           </label>
         </div>
       </details>
 
-      <details class="panel">
+      <details class="panel" data-panel-id="metronome">
         <summary class="panel__hd">
           <span class="panel__title">Metronome</span>
-          <label class="check-pair check-pair--hd" onclick="event.stopPropagation()">
+          <label class="check-pair check-pair--hd" onclick="event.stopPropagation()" title="Enable or disable the metronome">
             <input id="metronomeEnabled" type="checkbox" />
             <span>On</span>
           </label>
           <span class="panel__arrow">▾</span>
         </summary>
         <div class="panel__body">
-          <div class="two-col">
-            <label class="field-stacked">
-              <span class="field-label">BPM</span>
+          <div class="timing-trio metronome-trio">
+            <label class="timing-cell" title="Beats per minute for the metronome">
+              <span class="timing-cell__lbl">BPM</span>
               <input id="metronomeBpm" type="number" min="20" max="300" step="1" value="96" />
             </label>
-            <label class="field-stacked">
-              <span class="field-label">Offset (s)</span>
+            <label class="timing-cell" title="Time offset applied to the metronome grid">
+              <span class="timing-cell__lbl">Offset (s)</span>
               <input id="metronomeOffset" type="number" step="0.01" value="0" />
             </label>
-            <label class="field-stacked">
-              <span class="field-label">Beats / bar</span>
+            <label class="timing-cell" title="How many beats make up one bar">
+              <span class="timing-cell__lbl">Beats / bar</span>
               <input id="metronomeBeatsPerBar" type="number" min="1" max="12" step="1" value="4" />
             </label>
           </div>
-          <div class="slider-row">
+          <div class="slider-row" title="Metronome click volume">
             <span class="slider-row__lbl">Volume</span>
             <input id="metronomeVolume" type="range" min="0" max="1" step="0.01" value="0.35" />
             <span id="metronomeVolumeLabel" class="slider-row__val">35%</span>
@@ -260,19 +260,26 @@ Auto-JP: カラオケが好き"></textarea>
         </div>
       </details>
 
+      <details class="panel" data-panel-id="keybinds" open>
+        <summary class="panel__hd">
+          <span class="panel__title">Keybinds</span>
+          <span class="panel__arrow">▾</span>
+        </summary>
+        <div class="panel__body">
+          <div id="keybindEditor" class="two-col keybind-grid"></div>
+        </div>
+      </details>
     </aside>
 
     <main class="mainpane">
-
-      <!-- WAVEFORM -->
-      <div class="main-section is-open">
+      <div class="main-section is-open" data-section-id="waveform">
         <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Waveform</span>
           <div class="section-bar__right">
-            <button id="zoomOutBtn"      class="btn btn-ghost btn-xs">−</button>
-            <button id="zoomInBtn"       class="btn btn-ghost btn-xs">+</button>
-            <button id="fitSongBtn"      class="btn btn-ghost btn-xs">Fit song</button>
-            <button id="fitSelectionBtn" class="btn btn-ghost btn-xs">Fit sel</button>
+            <button id="zoomOutBtn" class="btn btn-ghost btn-xs" title="Zoom the waveform out">−</button>
+            <button id="zoomInBtn" class="btn btn-ghost btn-xs" title="Zoom the waveform in">+</button>
+            <button id="fitSongBtn" class="btn btn-ghost btn-xs" title="Fit the full song in view">Fit song</button>
+            <button id="fitSelectionBtn" class="btn btn-ghost btn-xs" title="Fit the current target in view">Fit sel</button>
             <span id="viewRangeLabel" class="view-range">0:00 → 0:00</span>
           </div>
           <span class="section-bar__arrow">▾</span>
@@ -287,8 +294,7 @@ Auto-JP: カラオケが好き"></textarea>
         </div>
       </div>
 
-      <!-- LYRICS -->
-      <div class="main-section main-section--flex is-open">
+      <div class="main-section main-section--flex is-open" data-section-id="lyrics">
         <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Lyrics</span>
           <div class="section-bar__right">
@@ -304,20 +310,19 @@ Auto-JP: カラオケが好き"></textarea>
         </div>
       </div>
 
-      <!-- PITCH ROLL -->
-      <div class="main-section main-section--flex is-open">
+      <div class="main-section main-section--flex is-open" data-section-id="pitch-roll">
         <div class="section-bar section-bar--clickable">
           <span class="section-bar__title">Pitch roll</span>
           <div class="section-bar__right">
-            <label class="check-pair" title="Play guide synth">
+            <label class="check-pair" title="Play the guide synth for syllables with pitch">
               <input id="guideSynthEnabled" type="checkbox" />
               <span>Guide synth</span>
             </label>
-            <label class="field-inline-sm">
+            <label class="field-inline-sm" title="Lowest MIDI note shown on the pitch roll">
               <span>Low</span>
               <input id="pitchMinInput" type="number" min="24" max="108" step="1" value="48" />
             </label>
-            <label class="field-inline-sm">
+            <label class="field-inline-sm" title="Highest MIDI note shown on the pitch roll">
               <span>High</span>
               <input id="pitchMaxInput" type="number" min="24" max="108" step="1" value="76" />
             </label>
@@ -330,7 +335,6 @@ Auto-JP: カラオケが好き"></textarea>
           </div>
         </div>
       </div>
-
     </main>
   </div>
 
@@ -344,7 +348,6 @@ Auto-JP: カラオケが好き"></textarea>
 
   <script src="app.js" defer></script>
   <script>
-    // Sidebar panels — whole label toggles except interactive children
     document.querySelectorAll('details.panel').forEach(d => {
       d.addEventListener('toggle', () => {
         const a = d.querySelector('.panel__arrow');
@@ -359,7 +362,6 @@ Auto-JP: カラオケが好き"></textarea>
       });
     });
 
-    // Main-pane collapsible sections
     document.querySelectorAll('.main-section .section-bar--clickable').forEach(bar => {
       bar.addEventListener('click', (e) => {
         if (e.target.closest('button, input, select, label, .check-pair')) return;
@@ -371,11 +373,12 @@ Auto-JP: カラオケが好き"></textarea>
       });
     });
 
-    // Sidebar resize handle
     const sidebar = document.querySelector('.sidebar');
-    const handle  = document.querySelector('.sidebar-resize');
+    const handle = document.querySelector('.sidebar-resize');
     if (handle && sidebar) {
-      let dragging = false, startX = 0, startW = 0;
+      let dragging = false;
+      let startX = 0;
+      let startW = 0;
       handle.addEventListener('pointerdown', e => {
         dragging = true;
         startX = e.clientX;

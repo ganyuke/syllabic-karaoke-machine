@@ -977,6 +977,10 @@ canvas {
   .t-scrub { min-width: 100%; }
 }
 
+@media (max-width: 760px) {
+  .keybind-grid { grid-template-columns: 1fr; }
+}
+
 @media (max-width: 520px) {
   .topbar-mid { flex-wrap: wrap; }
   .brand-serif { font-size: 15px; }
@@ -1067,4 +1071,87 @@ canvas {
 /* Word that contains the currently selected syllable — override unsynced fade */
 .lyric-word.unsynced.has-selected-syllable {
   opacity: 1;
+}
+
+/* ════════════════════════════════════════════
+   IMPORT SPLIT BUTTON
+════════════════════════════════════════════ */
+.split-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  flex: 0 0 auto;
+}
+
+.split-btn > .btn {
+  position: relative;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.split-btn__main {
+  border-top-left-radius: var(--r) !important;
+  border-bottom-left-radius: var(--r) !important;
+  border-top-right-radius: 0 !important;
+  border-bottom-right-radius: 0 !important;
+  padding-right: 11px;
+}
+
+.split-btn__toggle {
+  min-width: 28px;
+  padding: 5px 8px;
+  border-top-left-radius: 0 !important;
+  border-bottom-left-radius: 0 !important;
+  border-top-right-radius: var(--r) !important;
+  border-bottom-right-radius: var(--r) !important;
+  margin-left: -1px;
+}
+
+.split-btn__menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: max(100%, 132px);
+  padding: 4px;
+  border: 1px solid var(--rule);
+  border-radius: var(--r);
+  background: var(--paper);
+  box-shadow: 0 8px 24px rgba(26,22,15,0.12);
+  z-index: 120;
+}
+
+.split-btn__menu-item {
+  display: block;
+  width: 100%;
+  justify-content: flex-start;
+  min-height: 28px;
+  padding: 5px 9px;
+  border-radius: calc(var(--r) - 1px);
+  text-align: left;
+}
+
+.keybind-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.keybind-field input {
+  font-family: var(--mono);
+}
+
+.field-label--with-warning {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.keybind-warning-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--amber);
+  cursor: help;
 }

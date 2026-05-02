@@ -1,16 +1,9 @@
 const APP_ID = 'syllable-karaoke-studio';
-const APP_VERSION = 2;
+const APP_VERSION = 4;
 const DB_NAME = 'syllable-karaoke-studio-db';
 const DB_STORE = 'projects';
 const AUTOSAVE_STATE_KEY = 'autosave-state';
 const AUTOSAVE_AUDIO_KEY = 'autosave-audio';
-
-const DEMO_LYRICS = `[Verse]
-ka-ra-o-ke ga su-ki
-
-[Chorus]
-kokoro no uta
-カラオケが好き`;
 
 const FULL_VIEW_MIN = 1;
 const VIEW_MIN_DURATION = 0.3;
@@ -23,6 +16,49 @@ const LATIN_RE = /^[A-Za-z]+$/;
 const SECTION_LABEL_RE = /^\s*\[[^\]]+\]\s*$/;
 const EDGE_PUNCT_RE = /^[\s"'“”‘’.,!?！？。、・･:;()\[\]{}「」『』【】〈〉《》]+|[\s"'“”‘’.,!?！？。、・･:;()\[\]{}「」『』【】〈〉《》]+$/g;
 const SMALL_KANA_RE = /[ゃゅょャュョぁぃぅぇぉァィゥェォゎヮゕゖ]/;
+
+const DEFAULT_KEYBINDS = {
+  tapTiming: ['enter', 'k', 'z', 'x'],
+  playPause: ['space'],
+  setStart: ['s'],
+  setEnd: ['e'],
+  seekBackward: ['j'],
+  seekForward: ['l'],
+  nudgeBack: [','],
+  nudgeForward: ['.'],
+  clearTiming: ['delete'],
+  clearOrPitch: ['backspace'],
+  selectSounding: ['a'],
+  jump: ['g'],
+  pitchUp: ['arrowup'],
+  pitchDown: ['arrowdown'],
+  selectBack: ['[', 'arrowleft'],
+  selectForward: [']', 'arrowright'],
+};
+
+const DEFAULT_UI_STATE = {
+  collapsedPanels: {},
+  collapsedSections: {},
+};
+
+const ACTION_META = [
+  { id: 'tapTiming', label: 'Tap → next', description: 'Set start at playhead and advance.' },
+  { id: 'playPause', label: 'Play / Pause', description: 'Toggle playback.' },
+  { id: 'setStart', label: 'Set start', description: 'Set the selected syllable start.' },
+  { id: 'setEnd', label: 'Set end', description: 'Set the selected syllable end.' },
+  { id: 'seekBackward', label: 'Seek backward', description: 'Move the playhead backward by the seek step.' },
+  { id: 'seekForward', label: 'Seek forward', description: 'Move the playhead forward by the seek step.' },
+  { id: 'nudgeBack', label: 'Nudge start backward', description: 'Move the selected start backward.' },
+  { id: 'nudgeForward', label: 'Nudge start forward', description: 'Move the selected start forward.' },
+  { id: 'clearTiming', label: 'Clear timing', description: 'Clear timing on the selected syllable.' },
+  { id: 'clearOrPitch', label: 'Clear timing / pitch', description: 'Clear timing, or clear pitch in pitch mode.' },
+  { id: 'selectSounding', label: 'Select sounding', description: 'Select the syllable sounding at the playhead.' },
+  { id: 'jump', label: 'Jump', description: 'Jump to the current practice target.' },
+  { id: 'pitchUp', label: 'Pitch up', description: 'Raise pitch by 1, or 12 with Shift.' },
+  { id: 'pitchDown', label: 'Pitch down', description: 'Lower pitch by 1, or 12 with Shift.' },
+  { id: 'selectBack', label: 'Select previous', description: 'Select the previous syllable.' },
+  { id: 'selectForward', label: 'Select next', description: 'Select the next syllable.' },
+];
 
 const defaultState = () => ({
   projectName: '',
@@ -68,6 +104,8 @@ const defaultState = () => ({
     },
     followSounding: false,
     selectWithoutSeek: false,
+    keybinds: createDefaultKeybinds(),
+    ui: createDefaultUiState(),
   },
   selection: {
     syllableId: null,
@@ -88,10 +126,29 @@ const runtime = {
   metronomeGain: null,
   guideGain: null,
   guideVoice: null,
+  metronomeNode: null,
+  metronomeWorkletReady: null,
+  metronomeWorkletFailed: false,
+  waveformWorker: null,
+  waveformWorkerJobs: new Map(),
+  waveformJobId: 0,
+  transport: {
+    buffer: null,
+    sourceNode: null,
+    musicGain: null,
+    startContextTime: 0,
+    startOffset: 0,
+    pauseOffset: 0,
+    playing: false,
+    playToken: 0,
+  },
   dom: {
     lines: new Map(),
     words: new Map(),
     syllables: new Map(),
+    linesByIndex: [],
+    wordsByIndex: [],
+    syllablesByIndex: [],
   },
   index: {
     lines: [],
@@ -100,6 +157,16 @@ const runtime = {
     lineById: new Map(),
     wordById: new Map(),
     syllableById: new Map(),
+    timedEntries: [],
+    timedStarts: [],
+    timedEnds: [],
+    prevTimedStartByIndex: [],
+    nextTimedStartByIndex: [],
+    effectiveEnds: [],
+    snapPoints: [],
+    snapPointTimes: [],
+    syncedCount: 0,
+    maxTime: FULL_VIEW_MIN,
   },
   view: {
     start: 0,
@@ -130,6 +197,18 @@ const runtime = {
     lastTs: 0,
   },
   lastAutoScrolledLineId: null,
+  lyricsRender: {
+    forceFull: true,
+    lastCurrentTime: null,
+    lastSelectedSyllableId: null,
+    lastSelectedWordId: null,
+    lastSelectedLineId: null,
+    lastPracticeTargetKind: 'syllable',
+    lastPracticeTargetId: null,
+    lastSoundingSyllableId: null,
+    lastActiveLineId: null,
+    lastCompletedTimedIndex: -1,
+  },
   renderCache: {
     fontFamily: '',
     timelineBase: { canvas: null, key: '' },
@@ -140,12 +219,19 @@ const runtime = {
     waveformVersion: 0,
   },
   lastDrawnTime: null,
+  keyActionLookup: new Map(),
+  keybindConflicts: new Map(),
+  lastSetEndGesture: null,
 };
 
 const els = {
   projectName: document.getElementById('projectName'),
   audioFileInput: document.getElementById('audioFileInput'),
+  importProjectBtn: document.getElementById('importProjectBtn'),
   importProjectInput: document.getElementById('importProjectInput'),
+  importProjectMenuBtn: document.getElementById('importProjectMenuBtn'),
+  importProjectMenu: document.getElementById('importProjectMenu'),
+  importDemoProjectBtn: document.getElementById('importDemoProjectBtn'),
   exportProjectBtn: document.getElementById('exportProjectBtn'),
   clearProjectBtn: document.getElementById('clearProjectBtn'),
   embedAudioInExport: document.getElementById('embedAudioInExport'),
@@ -189,21 +275,16 @@ const els = {
   remainingTimeLabel: document.getElementById('remainingTimeLabel'),
 
   buildLyricsBtn: document.getElementById('buildLyricsBtn'),
-  sampleLyricsBtn: document.getElementById('sampleLyricsBtn'),
   lyricsInput: document.getElementById('lyricsInput'),
   splitModeSelect: document.getElementById('splitModeSelect'),
   excludeDoubleNewlines: document.getElementById('excludeDoubleNewlines'),
   excludeSectionLabels: document.getElementById('excludeSectionLabels'),
 
-  jumpSelectedMiniBtn: document.getElementById('jumpSelectedMiniBtn'),
-  copyPlayheadStartBtn: document.getElementById('copyPlayheadStartBtn'),
-  copyPlayheadEndBtn: document.getElementById('copyPlayheadEndBtn'),
   selectedSummaryDetail: document.getElementById('selectedSummaryDetail'),
   selectedStartInput: document.getElementById('selectedStartInput'),
   selectedEndInput: document.getElementById('selectedEndInput'),
   selectedPitchInput: document.getElementById('selectedPitchInput'),
   selectedPitchLabel: document.getElementById('selectedPitchLabel'),
-  applySelectedValuesBtn: document.getElementById('applySelectedValuesBtn'),
   clearSelectedEndBtn: document.getElementById('clearSelectedEndBtn'),
   nudgeBackLargeBtn: document.getElementById('nudgeBackLargeBtn'),
   nudgeBackBtn: document.getElementById('nudgeBackBtn'),
@@ -234,6 +315,7 @@ const els = {
   undoBtn: document.getElementById('undoBtn'),
   followSoundingCheckbox: document.getElementById('followSoundingCheckbox'),
   selectWithoutSeekCheckbox: document.getElementById('selectWithoutSeekCheckbox'),
+  keybindEditor: document.getElementById('keybindEditor'),
 };
 
 function uid(prefix) {
@@ -246,6 +328,251 @@ function deepClone(value) {
     return structuredClone(value);
   }
   return JSON.parse(JSON.stringify(value));
+}
+
+
+function createDefaultKeybinds() {
+  return Object.fromEntries(Object.entries(DEFAULT_KEYBINDS).map(([actionId, tokens]) => [actionId, [...tokens]]));
+}
+
+function createDefaultUiState() {
+  return deepClone(DEFAULT_UI_STATE);
+}
+
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char] || char));
+}
+
+function normalizeKeyToken(token) {
+  if (token === null || token === undefined) {
+    return '';
+  }
+  const raw = String(token).toLowerCase();
+  if (raw === ' ') {
+    return 'space';
+  }
+  let value = raw.trim();
+  if (!value) {
+    return '';
+  }
+  const aliases = {
+    spacebar: 'space',
+    space: 'space',
+    return: 'enter',
+    del: 'delete',
+    esc: 'escape',
+    left: 'arrowleft',
+    right: 'arrowright',
+    up: 'arrowup',
+    down: 'arrowdown',
+    comma: ',',
+    period: '.',
+    dot: '.',
+    fullstop: '.',
+    bracketleft: '[',
+    bracketright: ']',
+  };
+  value = aliases[value] || value;
+  if (/^[a-z0-9]$/.test(value)) {
+    return value;
+  }
+  if (['space', 'enter', 'delete', 'backspace', 'escape', 'arrowleft', 'arrowright', 'arrowup', 'arrowdown', '[', ']', ',', '.'].includes(value)) {
+    return value;
+  }
+  return '';
+}
+
+function formatKeyToken(token) {
+  const normalized = normalizeKeyToken(token);
+  if (!normalized) {
+    return '';
+  }
+  const labels = {
+    space: 'Space',
+    enter: 'Enter',
+    delete: 'Delete',
+    backspace: 'Backspace',
+    escape: 'Esc',
+    arrowleft: 'ArrowLeft',
+    arrowright: 'ArrowRight',
+    arrowup: 'ArrowUp',
+    arrowdown: 'ArrowDown',
+  };
+  if (labels[normalized]) {
+    return labels[normalized];
+  }
+  return normalized.length === 1 ? normalized.toUpperCase() : normalized;
+}
+
+function serializeKeyTokenForInput(token) {
+  const normalized = normalizeKeyToken(token);
+  if (normalized === ',') {
+    return 'comma';
+  }
+  if (normalized === '.') {
+    return 'period';
+  }
+  return normalized;
+}
+
+function parseKeybindInputValue(value) {
+  return [...new Set(String(value || '')
+    .split(',')
+    .map((token) => normalizeKeyToken(token))
+    .filter(Boolean))];
+}
+
+function sanitizeKeybinds(keybinds) {
+  const defaults = createDefaultKeybinds();
+  const safe = {};
+  ACTION_META.forEach(({ id }) => {
+    if (Array.isArray(keybinds?.[id])) {
+      safe[id] = [...new Set(keybinds[id].map((token) => normalizeKeyToken(token)).filter(Boolean))];
+    } else {
+      safe[id] = [...defaults[id]];
+    }
+  });
+  return safe;
+}
+
+function sanitizeUiSettings(ui) {
+  return {
+    ...createDefaultUiState(),
+    ...(ui || {}),
+    collapsedPanels: { ...(ui?.collapsedPanels || {}) },
+    collapsedSections: { ...(ui?.collapsedSections || {}) },
+  };
+}
+
+function rebuildKeybindLookup() {
+  state.settings.keybinds = sanitizeKeybinds(state.settings.keybinds);
+  const lookup = new Map();
+  const conflicts = new Map();
+  ACTION_META.forEach(({ id }) => {
+    (state.settings.keybinds[id] || []).forEach((token) => {
+      if (!lookup.has(token)) {
+        lookup.set(token, id);
+        return;
+      }
+      const owners = conflicts.get(token) || [lookup.get(token)];
+      if (!owners.includes(id)) {
+        owners.push(id);
+      }
+      conflicts.set(token, owners);
+    });
+  });
+  runtime.keyActionLookup = lookup;
+  runtime.keybindConflicts = conflicts;
+}
+
+function getActionMeta(actionId) {
+  return ACTION_META.find((meta) => meta.id === actionId) || null;
+}
+
+function getActionConflictWarnings(actionId) {
+  const warnings = [];
+  const tokens = state.settings.keybinds?.[actionId] || [];
+  tokens.forEach((token) => {
+    const owners = runtime.keybindConflicts.get(token) || [];
+    if (!owners.includes(actionId)) {
+      return;
+    }
+    const otherLabels = owners
+      .filter((ownerId) => ownerId !== actionId)
+      .map((ownerId) => getActionMeta(ownerId)?.label || ownerId);
+    if (otherLabels.length) {
+      warnings.push(`${formatKeyToken(token)} is also bound to ${otherLabels.join(', ')}.`);
+    }
+  });
+  return warnings;
+}
+
+function renderKeybindEditor() {
+  if (!els.keybindEditor) {
+    return;
+  }
+  rebuildKeybindLookup();
+  const fields = ACTION_META.map((meta) => {
+    const tokens = state.settings.keybinds?.[meta.id] || [];
+    const warnings = getActionConflictWarnings(meta.id);
+    const warningTitle = warnings.length ? ` title="${escapeHtml(warnings.join('\n'))}"` : '';
+    const warningGlyph = warnings.length ? `<span class="keybind-warning-glyph" aria-label="Conflicting keybind"${warningTitle}>⚠</span>` : '';
+    const inputTitle = `${meta.description} Use commas for multiple keys.`;
+    return `
+      <label class="field-stacked keybind-field" title="${escapeHtml(meta.description)}">
+        <span class="field-label field-label--with-warning">
+          <span>${escapeHtml(meta.label)}</span>
+          ${warningGlyph}
+        </span>
+        <input type="text" data-keybind-action="${meta.id}" value="${escapeHtml(tokens.map((token) => serializeKeyTokenForInput(token)).join(', '))}" placeholder="keys" title="${escapeHtml(inputTitle)}" />
+      </label>`;
+  }).join('');
+  els.keybindEditor.innerHTML = fields;
+  els.keybindEditor.querySelectorAll('[data-keybind-action]').forEach((input) => {
+    input.addEventListener('change', onKeybindInputChange);
+    input.addEventListener('blur', onKeybindInputChange);
+  });
+}
+
+function onKeybindInputChange(event) {
+  const actionId = event.target.dataset.keybindAction;
+  if (!actionId || !state.settings.keybinds) {
+    return;
+  }
+  state.settings.keybinds[actionId] = parseKeybindInputValue(event.target.value);
+  renderKeybindEditor();
+  scheduleAutosave();
+}
+
+function applyUiState() {
+  state.settings.ui = sanitizeUiSettings(state.settings.ui);
+  document.querySelectorAll('details.panel[data-panel-id]').forEach((panel) => {
+    const panelId = panel.dataset.panelId;
+    panel.open = !state.settings.ui.collapsedPanels?.[panelId];
+  });
+  document.querySelectorAll('.main-section[data-section-id]').forEach((section) => {
+    const sectionId = section.dataset.sectionId;
+    section.classList.toggle('is-open', !state.settings.ui.collapsedSections?.[sectionId]);
+  });
+  window.dispatchEvent(new Event('resize'));
+}
+
+function confirmDestructiveAction(message) {
+  return window.confirm(message);
+}
+
+function runJumpAction() {
+  return jumpToTarget().catch((error) => console.warn(error));
+}
+
+function updateLastSetEndGesture(entry, time) {
+  runtime.lastSetEndGesture = {
+    syllableId: entry.id,
+    time,
+    at: performance.now(),
+  };
+}
+
+function getNextStartedEntry(globalIndex) {
+  for (let i = globalIndex + 1; i < runtime.index.syllables.length; i += 1) {
+    const next = runtime.index.syllables[i];
+    if (isFiniteNumber(next?.syllable?.start)) {
+      return next;
+    }
+  }
+  return null;
+}
+
+function shouldAutoClearEndOnRepeat(entry, nextEntry, requestedEnd) {
+  const last = runtime.lastSetEndGesture;
+  if (!last || !nextEntry || !isFiniteNumber(nextEntry.syllable.start)) {
+    return false;
+  }
+  const quickRepeat = performance.now() - last.at <= 800;
+  const sameSyllable = last.syllableId === entry.id;
+  const sameTime = Math.abs(last.time - requestedEnd) <= 0.075;
+  const collides = requestedEnd >= nextEntry.syllable.start - EPSILON;
+  return quickRepeat && sameSyllable && sameTime && collides;
 }
 
 const MAX_UNDO = 60;
@@ -266,6 +593,7 @@ function performUndo() {
   renderLyrics();
   updateSelectedEditor();
   updateSyncStatus();
+  markLyricsDirty();
   updateLyricsDynamic();
   markDirty();
   scheduleAutosave();
@@ -356,6 +684,24 @@ function markDirty() {
   runtime.drawDirty = true;
 }
 
+function markLyricsDirty() {
+  runtime.lyricsRender.forceFull = true;
+}
+
+function upperBound(sortedValues, target) {
+  let low = 0;
+  let high = sortedValues.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (sortedValues[mid] <= target) {
+      low = mid + 1;
+    } else {
+      high = mid;
+    }
+  }
+  return low;
+}
+
 function getUiFontFamily() {
   if (!runtime.renderCache.fontFamily) {
     runtime.renderCache.fontFamily = getComputedStyle(document.body).fontFamily;
@@ -388,27 +734,133 @@ function createRenderBuffer(width, height, existingCanvas = null) {
 }
 
 function getAudioDuration() {
+  if (runtime.transport.buffer?.duration) {
+    return runtime.transport.buffer.duration;
+  }
   if (isFiniteNumber(els.audioPlayer.duration) && els.audioPlayer.duration > 0) {
     return els.audioPlayer.duration;
   }
   return isFiniteNumber(state.audioMeta.duration) ? state.audioMeta.duration : 0;
 }
 
+function getIsPlaying() {
+  return !!runtime.transport.playing;
+}
+
 function getCurrentTime() {
-  return isFiniteNumber(els.audioPlayer.currentTime) ? els.audioPlayer.currentTime : 0;
+  if (runtime.transport.playing && runtime.audioContext) {
+    const rate = Math.max(0.1, state.settings.playbackRate);
+    const elapsed = Math.max(0, runtime.audioContext.currentTime - runtime.transport.startContextTime);
+    return clamp(runtime.transport.startOffset + elapsed * rate, 0, getAudioDuration());
+  }
+  return clamp(runtime.transport.pauseOffset || 0, 0, getAudioDuration());
+}
+
+function mirrorMediaElementTime(time) {
+  try {
+    els.audioPlayer.currentTime = clamp(time, 0, Math.max(getAudioDuration(), 0));
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+function clearTransportSource() {
+  const source = runtime.transport.sourceNode;
+  runtime.transport.sourceNode = null;
+  if (!source) {
+    return;
+  }
+  source.onended = null;
+  try {
+    source.stop();
+  } catch {}
+  try {
+    source.disconnect();
+  } catch {}
+}
+
+function setTransportPausedTime(time) {
+  runtime.transport.pauseOffset = clamp(time, 0, getAudioDuration());
+  mirrorMediaElementTime(runtime.transport.pauseOffset);
+}
+
+function handleTransportEnded(token) {
+  if (token !== runtime.transport.playToken || !runtime.transport.playing) {
+    return;
+  }
+  runtime.transport.playing = false;
+  runtime.transport.sourceNode = null;
+  setTransportPausedTime(getAudioDuration());
+  stopGuideVoice();
+  updateTransportUi();
+  resetAudioOverlayState();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+}
+
+function restartTransportPlayback(time = getCurrentTime()) {
+  if (!runtime.audioContext || !runtime.transport.buffer) {
+    setTransportPausedTime(time);
+    return false;
+  }
+  const duration = getAudioDuration();
+  const startTime = clamp(time, 0, duration);
+  if (!(duration > 0) || startTime >= duration - 1e-4) {
+    runtime.transport.playing = false;
+    setTransportPausedTime(duration);
+    syncMetronomeTransport(true);
+    updateTransportUi();
+    return false;
+  }
+  clearTransportSource();
+  const source = runtime.audioContext.createBufferSource();
+  const token = ++runtime.transport.playToken;
+  source.buffer = runtime.transport.buffer;
+  source.playbackRate.value = Math.max(0.1, state.settings.playbackRate);
+  source.connect(runtime.transport.musicGain);
+  source.onended = () => handleTransportEnded(token);
+  runtime.transport.sourceNode = source;
+  runtime.transport.startContextTime = runtime.audioContext.currentTime;
+  runtime.transport.startOffset = startTime;
+  runtime.transport.pauseOffset = startTime;
+  runtime.transport.playing = true;
+  mirrorMediaElementTime(startTime);
+  source.start(0, startTime);
+  syncMetronomeTransport(true);
+  updateTransportUi();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
+  return true;
+}
+
+async function playTransport({ seekTime = null } = {}) {
+  await ensureAudioContext(true);
+  if (!runtime.transport.buffer) {
+    return false;
+  }
+  const startTime = seekTime === null ? getCurrentTime() : seekTime;
+  return restartTransportPlayback(startTime);
+}
+
+function pauseTransport({ time = getCurrentTime() } = {}) {
+  runtime.transport.playing = false;
+  ++runtime.transport.playToken;
+  clearTransportSource();
+  setTransportPausedTime(time);
+  resetAudioOverlayState();
+  stopGuideVoice();
+  updateTransportUi();
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
+}
+
+function clearTransportBuffer() {
+  pauseTransport({ time: 0 });
+  runtime.transport.buffer = null;
+  runtime.transport.pauseOffset = 0;
+  runtime.transport.startContextTime = 0;
+  runtime.transport.startOffset = 0;
 }
 
 function getProjectMaxTime() {
-  let max = getAudioDuration();
-  runtime.index.syllables.forEach((entry) => {
-    if (isFiniteNumber(entry.syllable.start)) {
-      max = Math.max(max, entry.syllable.start);
-    }
-    if (isFiniteNumber(entry.syllable.end)) {
-      max = Math.max(max, entry.syllable.end);
-    }
-  });
-  return Math.max(FULL_VIEW_MIN, max || FULL_VIEW_MIN);
+  return Math.max(FULL_VIEW_MIN, runtime.index.maxTime || getAudioDuration() || FULL_VIEW_MIN);
 }
 
 function mergeStateDefaults(project) {
@@ -443,6 +895,8 @@ function mergeStateDefaults(project) {
       followSounding: incoming.settings?.followSounding ?? base.settings.followSounding,
       selectWithoutSeek: incoming.settings?.selectWithoutSeek ?? base.settings.selectWithoutSeek,
       autoScrollWindow: incoming.settings?.autoScrollWindow ?? base.settings.autoScrollWindow,
+      keybinds: sanitizeKeybinds(incoming.settings?.keybinds),
+      ui: sanitizeUiSettings(incoming.settings?.ui),
     },
     selection: {
       ...base.selection,
@@ -475,17 +929,49 @@ function normalizeStructure(structure = []) {
   }));
 }
 
-function serializeProject() {
+function serializeProject({ includeDerived = false } = {}) {
   return {
     appId: APP_ID,
     version: APP_VERSION,
     updatedAt: new Date().toISOString(),
     playback: {
       currentTime: getCurrentTime(),
-      wasPlaying: !els.audioPlayer.paused,
+      wasPlaying: getIsPlaying(),
     },
-    project: deepClone(state),
+    project: createSerializableProjectState({ includeDerived }),
   };
+}
+
+function createSerializableProjectState({ includeDerived = false } = {}) {
+  const project = {
+    projectName: state.projectName,
+    lyricsMarkup: state.lyricsMarkup,
+    structure: state.structure.map((line) => ({
+      id: line.id,
+      raw: line.raw,
+      words: line.words.map((word) => ({
+        id: word.id,
+        raw: word.raw,
+        text: word.text,
+        showJoiners: !!word.showJoiners,
+        syllables: word.syllables.map((syllable) => ({
+          id: syllable.id,
+          text: syllable.text,
+          start: isFiniteNumber(syllable.start) ? syllable.start : null,
+          end: isFiniteNumber(syllable.end) ? syllable.end : null,
+          pitch: isFiniteNumber(syllable.pitch) ? syllable.pitch : null,
+        })),
+      })),
+    })),
+    audioMeta: { ...state.audioMeta },
+    settings: deepClone(state.settings),
+    selection: { ...state.selection },
+    practiceTarget: { ...state.practiceTarget },
+  };
+  if (includeDerived) {
+    project.waveformPeaks = state.waveformPeaks;
+  }
+  return project;
 }
 
 async function blobToDataUrl(blob) {
@@ -688,21 +1174,64 @@ function revokeCurrentObjectUrl() {
   }
 }
 
+function applyAudioContextSettings() {
+  if (runtime.transport.musicGain) {
+    runtime.transport.musicGain.gain.value = clamp(state.settings.musicVolume, 0, 1);
+  }
+  if (runtime.metronomeGain) {
+    runtime.metronomeGain.gain.value = clamp(state.settings.metronome.volume, 0, 1);
+  }
+  if (runtime.guideGain) {
+    runtime.guideGain.gain.value = clamp(state.settings.guideSynth.volume, 0, 1);
+  }
+}
+
 async function ensureAudioContext(resume = false) {
   if (!runtime.audioContext) {
+    if (!resume) {
+      return null;
+    }
     const Ctx = window.AudioContext || window.webkitAudioContext;
     runtime.audioContext = new Ctx();
+    runtime.transport.musicGain = runtime.audioContext.createGain();
     runtime.metronomeGain = runtime.audioContext.createGain();
     runtime.guideGain = runtime.audioContext.createGain();
+    runtime.transport.musicGain.connect(runtime.audioContext.destination);
     runtime.metronomeGain.connect(runtime.audioContext.destination);
     runtime.guideGain.connect(runtime.audioContext.destination);
+    ensureMetronomeWorklet().catch((error) => console.warn(error));
   }
-  runtime.metronomeGain.gain.value = clamp(state.settings.metronome.volume, 0, 1);
-  runtime.guideGain.gain.value = clamp(state.settings.guideSynth.volume, 0, 1);
+  applyAudioContextSettings();
   if (resume && runtime.audioContext.state === 'suspended') {
     await runtime.audioContext.resume();
   }
+  await ensureMetronomeWorklet();
   return runtime.audioContext;
+}
+
+async function decodeAudioBlobForWaveform(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  if (OfflineCtx) {
+    const offlineContext = new OfflineCtx(1, 1, 44100);
+    return offlineContext.decodeAudioData(arrayBuffer.slice(0));
+  }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) {
+    throw new Error('Web Audio API is unavailable.');
+  }
+  const tempContext = new Ctx();
+  try {
+    return await tempContext.decodeAudioData(arrayBuffer.slice(0));
+  } finally {
+    if (typeof tempContext.close === 'function') {
+      try {
+        await tempContext.close();
+      } catch (error) {
+        console.warn(error);
+      }
+    }
+  }
 }
 
 function computeWaveformPeaks(audioBuffer) {
@@ -712,8 +1241,8 @@ function computeWaveformPeaks(audioBuffer) {
   const targetSamples = clamp(Math.round(duration * 120), 4000, 48000);
   const blockSize = Math.max(1, Math.floor(length / targetSamples));
   const actualSamples = Math.max(1, Math.ceil(length / blockSize));
-  const min = new Array(actualSamples).fill(0);
-  const max = new Array(actualSamples).fill(0);
+  const min = new Float32Array(actualSamples);
+  const max = new Float32Array(actualSamples);
   for (let i = 0; i < actualSamples; i += 1) {
     const start = i * blockSize;
     const end = Math.min(start + blockSize, length);
@@ -723,12 +1252,8 @@ function computeWaveformPeaks(audioBuffer) {
       const data = audioBuffer.getChannelData(channel);
       for (let j = start; j < end; j += 1) {
         const value = data[j];
-        if (value < blockMin) {
-          blockMin = value;
-        }
-        if (value > blockMax) {
-          blockMax = value;
-        }
+        if (value < blockMin) blockMin = value;
+        if (value > blockMax) blockMax = value;
       }
     }
     min[i] = blockMin === 1 ? 0 : blockMin;
@@ -742,12 +1267,17 @@ function normalizeWaveformPeaks(peaks) {
     return null;
   }
   if (Array.isArray(peaks)) {
-    const max = peaks.map((value) => Math.max(0, value || 0));
-    const min = max.map((value) => -value);
+    const max = Float32Array.from(peaks.map((value) => Math.max(0, value || 0)));
+    const min = Float32Array.from(max, (value) => -value);
     return { min, max };
   }
-  if (Array.isArray(peaks.min) && Array.isArray(peaks.max) && peaks.min.length && peaks.max.length) {
-    return peaks;
+  const hasMin = Array.isArray(peaks.min) || ArrayBuffer.isView(peaks.min);
+  const hasMax = Array.isArray(peaks.max) || ArrayBuffer.isView(peaks.max);
+  if (hasMin && hasMax && peaks.min.length && peaks.max.length) {
+    return {
+      min: ArrayBuffer.isView(peaks.min) ? peaks.min : Float32Array.from(peaks.min),
+      max: ArrayBuffer.isView(peaks.max) ? peaks.max : Float32Array.from(peaks.max),
+    };
   }
   return null;
 }
@@ -776,12 +1306,8 @@ function getWaveformRangeAtIndices(peaks, startIndex, endIndex) {
   for (let i = start; i < end; i += 1) {
     const lo = peaks.min[i] || 0;
     const hi = peaks.max[i] || 0;
-    if (i === start || lo < min) {
-      min = lo;
-    }
-    if (i === start || hi > max) {
-      max = hi;
-    }
+    if (i === start || lo < min) min = lo;
+    if (i === start || hi > max) max = hi;
   }
   return { min, max };
 }
@@ -793,8 +1319,8 @@ function buildWaveformLevels(peaks) {
   }
   const levels = [];
   let current = {
-    min: Float32Array.from(peaks.min.slice(0, baseCount)),
-    max: Float32Array.from(peaks.max.slice(0, baseCount)),
+    min: ArrayBuffer.isView(peaks.min) ? new Float32Array(peaks.min) : Float32Array.from(peaks.min.slice(0, baseCount)),
+    max: ArrayBuffer.isView(peaks.max) ? new Float32Array(peaks.max) : Float32Array.from(peaks.max.slice(0, baseCount)),
     stride: 1,
   };
   levels.push(current);
@@ -808,14 +1334,106 @@ function buildWaveformLevels(peaks) {
       nextMin[i] = Math.min(current.min[left], current.min[right]);
       nextMax[i] = Math.max(current.max[left], current.max[right]);
     }
-    current = {
-      min: nextMin,
-      max: nextMax,
-      stride: current.stride * 2,
-    };
+    current = { min: nextMin, max: nextMax, stride: current.stride * 2 };
     levels.push(current);
   }
   return levels;
+}
+
+function serializeWaveformLevelsForTransfer(levels) {
+  return (levels || []).map((level) => ({
+    stride: level.stride,
+    min: ArrayBuffer.isView(level.min) ? level.min.buffer : Float32Array.from(level.min).buffer,
+    max: ArrayBuffer.isView(level.max) ? level.max.buffer : Float32Array.from(level.max).buffer,
+  }));
+}
+
+function deserializeWaveformLevels(levels) {
+  return (levels || []).map((level) => ({
+    stride: level.stride,
+    min: level.min instanceof Float32Array ? level.min : new Float32Array(level.min),
+    max: level.max instanceof Float32Array ? level.max : new Float32Array(level.max),
+  }));
+}
+
+function initWaveformWorker() {
+  if (runtime.waveformWorker) {
+    return runtime.waveformWorker;
+  }
+  const worker = new Worker('waveform-worker.js');
+  worker.addEventListener('message', (event) => {
+    const { id, ok, error, peaks, levels, dataUrl } = event.data || {};
+    const pending = runtime.waveformWorkerJobs.get(id);
+    if (!pending) {
+      return;
+    }
+    runtime.waveformWorkerJobs.delete(id);
+    if (!ok) {
+      pending.reject(new Error(error || 'Waveform analysis failed.'));
+      return;
+    }
+    if (typeof dataUrl === 'string') {
+      pending.resolve(dataUrl);
+      return;
+    }
+    pending.resolve({
+      peaks: {
+        min: peaks?.min instanceof Float32Array ? peaks.min : new Float32Array(peaks?.min || 0),
+        max: peaks?.max instanceof Float32Array ? peaks.max : new Float32Array(peaks?.max || 0),
+      },
+      levels: deserializeWaveformLevels(levels),
+    });
+  });
+  runtime.waveformWorker = worker;
+  return worker;
+}
+
+async function analyzeWaveformInWorker(audioBuffer) {
+  const worker = initWaveformWorker();
+  const id = ++runtime.waveformJobId;
+  const channelBuffers = [];
+  const transferList = [];
+  for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
+    const copy = new Float32Array(audioBuffer.length);
+    copy.set(audioBuffer.getChannelData(channel));
+    channelBuffers.push(copy.buffer);
+    transferList.push(copy.buffer);
+  }
+  return new Promise((resolve, reject) => {
+    runtime.waveformWorkerJobs.set(id, { resolve, reject });
+    worker.postMessage({
+      id,
+      type: 'analyze-waveform',
+      channels: channelBuffers,
+      length: audioBuffer.length,
+      duration: audioBuffer.duration,
+    }, transferList);
+  });
+}
+
+async function blobToDataUrlViaWorker(blob) {
+  const worker = initWaveformWorker();
+  const id = ++runtime.waveformJobId;
+  return new Promise((resolve, reject) => {
+    runtime.waveformWorkerJobs.set(id, { resolve, reject });
+    worker.postMessage({
+      id,
+      type: 'blob-to-data-url',
+      blob,
+    });
+  });
+}
+
+function seedTimelineWaveformLevels(levels) {
+  const peaks = normalizeWaveformPeaks(state.waveformPeaks);
+  if (!peaks || !levels) {
+    runtime.renderCache.timelineWaveformLevels.key = '';
+    runtime.renderCache.timelineWaveformLevels.levels = null;
+    return;
+  }
+  const count = Math.min(peaks.min.length, peaks.max.length);
+  runtime.renderCache.timelineWaveformLevels.key = [runtime.renderCache.waveformVersion, count].join('|');
+  runtime.renderCache.timelineWaveformLevels.levels = levels;
 }
 
 function ensureTimelineWaveformLevels() {
@@ -908,11 +1526,16 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
       duration: 0,
     };
     state.waveformPeaks = [];
+    runtime.transport.buffer = null;
     runtime.renderCache.waveformVersion += 1;
+    seedTimelineWaveformLevels(null);
     invalidateRenderCaches();
+    rebuildTimingCaches();
+    markLyricsDirty();
     revokeCurrentObjectUrl();
     els.audioPlayer.removeAttribute('src');
     els.audioPlayer.load();
+    setTransportPausedTime(0);
     refreshAudioMeta();
     fitViewToSong();
     resetAudioOverlayState();
@@ -926,8 +1549,7 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
 
   const seekTime = isFiniteNumber(restoreTime) && restoreTime > 0 ? restoreTime : 0;
   try {
-    els.audioPlayer.pause();
-    els.audioPlayer.currentTime = 0;
+    pauseTransport({ time: 0 });
   } catch (error) {
     console.warn('Audio reset before load failed:', error);
   }
@@ -947,6 +1569,7 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
     duration: state.audioMeta.duration || 0,
   };
 
+  setTransportPausedTime(seekTime);
   refreshAudioMeta();
 
   // Wait for metadata so duration is available, then restore position.
@@ -977,22 +1600,37 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
   }
 
   try {
-    const context = await ensureAudioContext(false);
-    const arrayBuffer = await blob.arrayBuffer();
-    const decoded = await context.decodeAudioData(arrayBuffer.slice(0));
-    state.waveformPeaks = computeWaveformPeaks(decoded);
-    runtime.renderCache.waveformVersion += 1;
-    invalidateRenderCaches();
+    const decoded = await decodeAudioBlobForWaveform(blob);
+    runtime.transport.buffer = decoded;
     state.audioMeta.duration = decoded.duration;
+    setTransportPausedTime(Math.min(seekTime, decoded.duration || seekTime));
+    rebuildTimingCaches();
+    updateSaveStatus('Analyzing waveform…');
+    try {
+      const analysis = await analyzeWaveformInWorker(decoded);
+      state.waveformPeaks = analysis.peaks;
+      runtime.renderCache.waveformVersion += 1;
+      seedTimelineWaveformLevels(analysis.levels);
+      invalidateRenderCaches();
+    } catch (workerError) {
+      console.warn('Waveform worker failed, falling back to main thread.', workerError);
+      state.waveformPeaks = computeWaveformPeaks(decoded);
+      runtime.renderCache.waveformVersion += 1;
+      seedTimelineWaveformLevels(buildWaveformLevels(state.waveformPeaks));
+      invalidateRenderCaches();
+    }
   } catch (error) {
     console.warn('Could not decode waveform.', error);
+    runtime.transport.buffer = null;
     state.waveformPeaks = [];
+    seedTimelineWaveformLevels(null);
   }
 
   // Parse ID3/metadata tags and expose via Media Session API
   parseAudioFileMeta(blob).catch(console.warn);
 
   refreshAudioMeta();
+  rebuildTimingCaches();
   fitViewToSong();
   resetAudioOverlayState();
   markDirty();
@@ -1274,7 +1912,18 @@ function rebuildIndex() {
     lineById,
     wordById,
     syllableById,
+    timedEntries: [],
+    timedStarts: [],
+    timedEnds: [],
+    prevTimedStartByIndex: [],
+    nextTimedStartByIndex: [],
+    effectiveEnds: [],
+    snapPoints: [],
+    snapPointTimes: [],
+    syncedCount: 0,
+    maxTime: FULL_VIEW_MIN,
   };
+  rebuildTimingCaches();
 
   if (!state.selection.syllableId || !syllableById.has(state.selection.syllableId)) {
     state.selection.syllableId = syllables[0] ? syllables[0].id : null;
@@ -1291,6 +1940,83 @@ function rebuildIndex() {
       id: state.selection.syllableId,
     };
   }
+}
+
+function rebuildTimingCaches() {
+  const syllables = runtime.index.syllables;
+  const prevTimedStartByIndex = new Array(syllables.length).fill(null);
+  const nextTimedStartByIndex = new Array(syllables.length).fill(null);
+  const effectiveEnds = new Array(syllables.length).fill(null);
+  const timedEntries = [];
+  const timedStarts = [];
+  const snapPoints = [];
+  let syncedCount = 0;
+  let maxTime = Math.max(FULL_VIEW_MIN, getAudioDuration());
+
+  let previousTimedStart = null;
+  for (let i = 0; i < syllables.length; i += 1) {
+    const entry = syllables[i];
+    prevTimedStartByIndex[i] = previousTimedStart;
+    if (isFiniteNumber(entry.syllable.start)) {
+      previousTimedStart = entry.syllable.start;
+      timedEntries.push(entry);
+      timedStarts.push(entry.syllable.start);
+      snapPoints.push({ time: entry.syllable.start, syllableId: entry.id });
+      syncedCount += 1;
+      maxTime = Math.max(maxTime, entry.syllable.start);
+    }
+    if (isFiniteNumber(entry.syllable.end)) {
+      snapPoints.push({ time: entry.syllable.end, syllableId: entry.id });
+      maxTime = Math.max(maxTime, entry.syllable.end);
+    }
+  }
+
+  let nextTimedStart = null;
+  for (let i = syllables.length - 1; i >= 0; i -= 1) {
+    nextTimedStartByIndex[i] = nextTimedStart;
+    const start = syllables[i].syllable.start;
+    if (isFiniteNumber(start)) {
+      nextTimedStart = start;
+    }
+  }
+
+  const duration = getAudioDuration();
+  for (let i = 0; i < syllables.length; i += 1) {
+    const entry = syllables[i];
+    const start = entry.syllable.start;
+    if (!isFiniteNumber(start)) {
+      continue;
+    }
+    let end = null;
+    if (isFiniteNumber(entry.syllable.end) && entry.syllable.end > start) {
+      end = entry.syllable.end;
+    } else if (isFiniteNumber(nextTimedStartByIndex[i])) {
+      end = nextTimedStartByIndex[i];
+    } else if (isFiniteNumber(duration) && duration > start) {
+      end = duration;
+    } else {
+      end = start + DEFAULT_TAIL;
+    }
+    effectiveEnds[i] = end;
+    maxTime = Math.max(maxTime, end);
+  }
+
+  const timedEnds = timedEntries.map((entry) => effectiveEnds[entry.globalIndex]);
+  snapPoints.sort((a, b) => a.time - b.time);
+
+  runtime.index = {
+    ...runtime.index,
+    timedEntries,
+    timedStarts,
+    timedEnds,
+    prevTimedStartByIndex,
+    nextTimedStartByIndex,
+    effectiveEnds,
+    snapPoints,
+    snapPointTimes: snapPoints.map((point) => point.time),
+    syncedCount,
+    maxTime: Math.max(FULL_VIEW_MIN, maxTime || FULL_VIEW_MIN),
+  };
 }
 
 function getSelectionEntry() {
@@ -1334,42 +2060,15 @@ function getLastSyllableIdForTarget(target) {
 }
 
 function findPreviousTimedSyllableStart(globalIndex) {
-  for (let i = globalIndex - 1; i >= 0; i -= 1) {
-    const start = runtime.index.syllables[i].syllable.start;
-    if (isFiniteNumber(start)) {
-      return start;
-    }
-  }
-  return null;
+  return runtime.index.prevTimedStartByIndex[globalIndex] ?? null;
 }
 
 function findNextTimedSyllableStart(globalIndex) {
-  for (let i = globalIndex + 1; i < runtime.index.syllables.length; i += 1) {
-    const start = runtime.index.syllables[i].syllable.start;
-    if (isFiniteNumber(start)) {
-      return start;
-    }
-  }
-  return null;
+  return runtime.index.nextTimedStartByIndex[globalIndex] ?? null;
 }
 
 function getEffectiveSyllableEnd(globalIndex) {
-  const entry = runtime.index.syllables[globalIndex];
-  if (!entry || !isFiniteNumber(entry.syllable.start)) {
-    return null;
-  }
-  if (isFiniteNumber(entry.syllable.end) && entry.syllable.end > entry.syllable.start) {
-    return entry.syllable.end;
-  }
-  const next = findNextTimedSyllableStart(globalIndex);
-  if (isFiniteNumber(next)) {
-    return next;
-  }
-  const duration = getAudioDuration();
-  if (isFiniteNumber(duration) && duration > entry.syllable.start) {
-    return duration;
-  }
-  return entry.syllable.start + DEFAULT_TAIL;
+  return runtime.index.effectiveEnds[globalIndex] ?? null;
 }
 
 function clampSyllableStart(globalIndex, time) {
@@ -1424,7 +2123,7 @@ function getRangeForTarget(target = getPracticeTarget()) {
 }
 
 function getSyncedCount() {
-  return runtime.index.syllables.filter((entry) => isFiniteNumber(entry.syllable.start)).length;
+  return runtime.index.syncedCount || 0;
 }
 
 function ensureTimeInView(time) {
@@ -1494,13 +2193,14 @@ function panViewTo(start) {
 
 function setPlayheadTimeImmediate(time) {
   const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
-  try {
-    els.audioPlayer.currentTime = clampedTime;
-  } catch (error) {
-    console.warn(error);
+  if (getIsPlaying()) {
+    restartTransportPlayback(clampedTime);
+  } else {
+    setTransportPausedTime(clampedTime);
+    resetAudioOverlayState();
+    updateTransportUi();
   }
-  resetAudioOverlayState();
-  updateTransportUi();
+  markLyricsDirty();
   updateLyricsDynamic();
   markDirty();
 }
@@ -1524,6 +2224,7 @@ function setSelectionSyllableById(id, { practiceKind = 'syllable', practiceId = 
   }
   updateSelectedEditor();
   updateLoopButton();
+  markLyricsDirty();
   updateLyricsDynamic();
   if (scroll) {
     scrollSelectionIntoView();
@@ -1567,7 +2268,7 @@ function updateLoopButton() {
 function updateTransportUi() {
   const duration = Math.max(getProjectMaxTime(), getAudioDuration(), 1);
   const currentTime = getCurrentTime();
-  els.playPauseBtn.textContent = els.audioPlayer.paused ? 'Play' : 'Pause';
+  els.playPauseBtn.textContent = getIsPlaying() ? 'Pause' : 'Play';
   els.currentTimeLabel.textContent = formatClock(currentTime, { hundredths: true });
   els.remainingTimeLabel.textContent = `-${formatClock(Math.max(0, duration - currentTime), { hundredths: true })}`;
   els.scrubInput.max = String(duration);
@@ -1611,6 +2312,10 @@ function syncInputsFromState() {
   els.audioPlayer.volume = state.settings.musicVolume;
   if (els.followSoundingCheckbox) els.followSoundingCheckbox.checked = state.settings.followSounding ?? false;
   if (els.selectWithoutSeekCheckbox) els.selectWithoutSeekCheckbox.checked = state.settings.selectWithoutSeek ?? false;
+  state.settings.keybinds = sanitizeKeybinds(state.settings.keybinds);
+  state.settings.ui = sanitizeUiSettings(state.settings.ui);
+  renderKeybindEditor();
+  applyUiState();
   updateUndoButton();
   updateLoopButton();
   refreshAudioMeta();
@@ -1662,6 +2367,7 @@ function buildLyricsStructure() {
   }
   state.lyricsMarkup = els.lyricsInput.value;
   state.structure = parseLyricsMarkup(state.lyricsMarkup, state.structure);
+  runtime.lastSetEndGesture = null;
   rebuildIndex();
   renderLyrics();
   syncInputsFromState();
@@ -1676,10 +2382,14 @@ function renderLyrics() {
   runtime.dom.lines.clear();
   runtime.dom.words.clear();
   runtime.dom.syllables.clear();
+  runtime.dom.linesByIndex = [];
+  runtime.dom.wordsByIndex = [];
+  runtime.dom.syllablesByIndex = [];
   els.lyricsStage.innerHTML = '';
 
   if (!state.structure.some((line) => line.words.length > 0)) {
     els.lyricsStage.appendChild(els.emptyLyricsTemplate.content.cloneNode(true));
+    markLyricsDirty();
     updateSyncStatus();
     return;
   }
@@ -1705,6 +2415,10 @@ function renderLyrics() {
       wordNode.dataset.wordId = word.id;
       wordNode.title = `Jump to word “${word.text || word.raw}”`;
       runtime.dom.words.set(word.id, wordNode);
+      const wordEntry = runtime.index.wordById.get(word.id);
+      if (wordEntry) {
+        runtime.dom.wordsByIndex[wordEntry.globalWordIndex] = wordNode;
+      }
 
       word.syllables.forEach((syllable, syllableIndex) => {
         const syllableNode = document.createElement('span');
@@ -1713,6 +2427,10 @@ function renderLyrics() {
         syllableNode.textContent = syllable.text;
         syllableNode.title = `Jump to syllable “${syllable.text}”`;
         runtime.dom.syllables.set(syllable.id, syllableNode);
+        const syllableEntry = runtime.index.syllableById.get(syllable.id);
+        if (syllableEntry) {
+          runtime.dom.syllablesByIndex[syllableEntry.globalIndex] = syllableNode;
+        }
         wordNode.appendChild(syllableNode);
         if (word.showJoiners && syllableIndex < word.syllables.length - 1) {
           const joiner = document.createElement('span');
@@ -1728,88 +2446,191 @@ function renderLyrics() {
     lineNode.append(lineButton, content);
     els.lyricsStage.appendChild(lineNode);
     runtime.dom.lines.set(line.id, lineNode);
+    runtime.dom.linesByIndex[lineIndex] = lineNode;
   });
 
+  markLyricsDirty();
   updateLyricsDynamic();
   updateSyncStatus();
 }
 
+function getCurrentSoundingEntryAtTime(time) {
+  const starts = runtime.index.timedStarts;
+  if (!starts.length) {
+    return null;
+  }
+  const timedIndex = upperBound(starts, time) - 1;
+  if (timedIndex < 0) {
+    return null;
+  }
+  const entry = runtime.index.timedEntries[timedIndex];
+  const end = runtime.index.timedEnds[timedIndex];
+  if (!entry || !isFiniteNumber(end) || time < entry.syllable.start || time >= end) {
+    return null;
+  }
+  return entry;
+}
+
 function getCurrentSoundingEntry() {
-  const currentTime = getCurrentTime();
-  for (const entry of runtime.index.syllables) {
-    const start = entry.syllable.start;
-    const end = getEffectiveSyllableEnd(entry.globalIndex);
-    if (isFiniteNumber(start) && isFiniteNumber(end) && currentTime >= start && currentTime < end) {
-      return entry;
+  return getCurrentSoundingEntryAtTime(getCurrentTime());
+}
+
+function getCompletedTimedIndexAtTime(time) {
+  const ends = runtime.index.timedEnds;
+  if (!ends.length) {
+    return -1;
+  }
+  return upperBound(ends, time) - 1;
+}
+
+function applySyllableVisualState(entry, currentTime) {
+  const node = runtime.dom.syllablesByIndex[entry.globalIndex] || runtime.dom.syllables.get(entry.id);
+  if (!node) {
+    return;
+  }
+  const start = entry.syllable.start;
+  const end = getEffectiveSyllableEnd(entry.globalIndex);
+  let fill = 0;
+  let isSounding = false;
+  let isComplete = false;
+  if (isFiniteNumber(start) && isFiniteNumber(end) && end > start) {
+    if (currentTime >= end) {
+      fill = 100;
+      isComplete = true;
+    } else if (currentTime > start) {
+      fill = clamp(((currentTime - start) / (end - start)) * 100, 0, 100);
+      isSounding = true;
     }
   }
-  return null;
+  const fillLabel = `${fill.toFixed(2)}%`;
+  if (node.dataset.fill !== fillLabel) {
+    node.style.setProperty('--fill', fillLabel);
+    node.dataset.fill = fillLabel;
+  }
+  const isSelected = entry.id === state.selection.syllableId;
+  node.classList.toggle('is-selected', isSelected);
+  node.classList.toggle('is-sounding', isSounding);
+  node.classList.toggle('is-complete', isComplete || fill >= 100);
+  node.classList.toggle('is-unsynced', !isFiniteNumber(start));
+}
+
+function applyWordVisualState(wordEntry) {
+  const node = runtime.dom.wordsByIndex[wordEntry.globalWordIndex] || runtime.dom.words.get(wordEntry.id);
+  if (!node) {
+    return;
+  }
+  const first = runtime.index.syllableById.get(wordEntry.firstSyllableId);
+  const start = first?.syllable.start;
+  const isSelectedWord = state.practiceTarget.kind === 'word' && state.practiceTarget.id === wordEntry.id;
+  const hasSelectedSyllable = wordEntry.id === getSelectionEntry()?.wordId;
+  node.classList.toggle('selected-word', isSelectedWord);
+  node.classList.toggle('unsynced', !isFiniteNumber(start));
+  node.classList.toggle('has-selected-syllable', hasSelectedSyllable);
+}
+
+function applyLineVisualState(lineEntry, activeLineId) {
+  const node = runtime.dom.linesByIndex[lineEntry.lineIndex] || runtime.dom.lines.get(lineEntry.id);
+  if (!node) {
+    return;
+  }
+  node.classList.toggle('active', lineEntry.id === activeLineId);
+  node.classList.toggle('selected-line', state.practiceTarget.kind === 'line' && state.practiceTarget.id === lineEntry.id);
+}
+
+function refreshLyricsDynamicAll(currentTime, soundingEntry, activeLineId) {
+  runtime.index.syllables.forEach((entry) => applySyllableVisualState(entry, currentTime));
+  runtime.index.words.forEach((entry) => applyWordVisualState(entry));
+  runtime.index.lines.forEach((entry) => applyLineVisualState(entry, activeLineId));
+  runtime.lyricsRender.lastCompletedTimedIndex = getCompletedTimedIndexAtTime(currentTime);
 }
 
 function updateLyricsDynamic() {
   const currentTime = getCurrentTime();
   const selectedEntry = getSelectionEntry();
   const practiceTarget = getPracticeTarget();
-  const soundingEntry = getCurrentSoundingEntry();
-  let activeLineId = soundingEntry?.lineId || null;
+  const soundingEntry = getCurrentSoundingEntryAtTime(currentTime);
+  const activeLineId = soundingEntry?.lineId || null;
+  const selectedWordId = selectedEntry?.wordId || null;
+  const selectedLineId = selectedEntry?.lineId || null;
+  const renderState = runtime.lyricsRender;
+  const timeMovedBackward = isFiniteNumber(renderState.lastCurrentTime) && currentTime + EPSILON < renderState.lastCurrentTime;
+  const timeJumped = !isFiniteNumber(renderState.lastCurrentTime) || Math.abs(currentTime - renderState.lastCurrentTime) > 0.35;
+  const selectionChanged = renderState.lastSelectedSyllableId !== state.selection.syllableId
+    || renderState.lastPracticeTargetKind !== practiceTarget.kind
+    || renderState.lastPracticeTargetId !== practiceTarget.id;
+  const shouldFullRefresh = renderState.forceFull || timeMovedBackward || timeJumped || selectionChanged;
 
-  runtime.index.syllables.forEach((entry) => {
-    const node = runtime.dom.syllables.get(entry.id);
-    if (!node) {
-      return;
+  if (shouldFullRefresh) {
+    refreshLyricsDynamicAll(currentTime, soundingEntry, activeLineId);
+    renderState.forceFull = false;
+  } else {
+    const completedTimedIndex = getCompletedTimedIndexAtTime(currentTime);
+    if (renderState.lastCompletedTimedIndex !== completedTimedIndex) {
+      const from = Math.min(renderState.lastCompletedTimedIndex, completedTimedIndex) + 1;
+      const to = Math.max(renderState.lastCompletedTimedIndex, completedTimedIndex);
+      for (let i = from; i <= to; i += 1) {
+        const entry = runtime.index.timedEntries[i];
+        if (entry) {
+          applySyllableVisualState(entry, currentTime);
+        }
+      }
+      renderState.lastCompletedTimedIndex = completedTimedIndex;
     }
-    const start = entry.syllable.start;
-    const end = getEffectiveSyllableEnd(entry.globalIndex);
-    let fill = 0;
-    let isSounding = false;
-    let isComplete = false;
-    if (isFiniteNumber(start) && isFiniteNumber(end) && end > start) {
-      if (currentTime >= end) {
-        fill = 100;
-        isComplete = true;
-      } else if (currentTime > start) {
-        fill = clamp(((currentTime - start) / (end - start)) * 100, 0, 100);
-        isSounding = true;
+
+    if (renderState.lastSoundingSyllableId && renderState.lastSoundingSyllableId !== soundingEntry?.id) {
+      const previousEntry = runtime.index.syllableById.get(renderState.lastSoundingSyllableId);
+      if (previousEntry) {
+        applySyllableVisualState(previousEntry, currentTime);
       }
     }
-    node.style.setProperty('--fill', `${fill}%`);
-    node.classList.toggle('is-selected', entry.id === state.selection.syllableId);
-    node.classList.toggle('is-sounding', isSounding);
-    node.classList.toggle('is-complete', isComplete || fill >= 100);
-    node.classList.toggle('is-unsynced', !isFiniteNumber(start));
-  });
-
-  runtime.index.words.forEach((entry) => {
-    const node = runtime.dom.words.get(entry.id);
-    if (!node) {
-      return;
+    if (soundingEntry) {
+      applySyllableVisualState(soundingEntry, currentTime);
     }
-    const first = runtime.index.syllableById.get(entry.firstSyllableId);
-    const start = first?.syllable.start;
-    const isSelectedWord = practiceTarget.kind === 'word' && practiceTarget.id === entry.id;
-    // Check if any syllable in this word is selected
-    const hasSelectedSyllable = entry.word.syllables.some(s => s.id === state.selection.syllableId);
-    node.classList.toggle('selected-word', isSelectedWord);
-    node.classList.toggle('unsynced', !isFiniteNumber(start));
-    // Lift opacity when word contains the selected syllable (overrides .unsynced fade)
-    node.classList.toggle('has-selected-syllable', hasSelectedSyllable);
-  });
 
-  runtime.index.lines.forEach((entry) => {
-    const node = runtime.dom.lines.get(entry.id);
-    if (!node) {
-      return;
+    if (renderState.lastSelectedSyllableId !== state.selection.syllableId) {
+      const previousSelected = runtime.index.syllableById.get(renderState.lastSelectedSyllableId);
+      if (previousSelected) {
+        applySyllableVisualState(previousSelected, currentTime);
+      }
+      if (selectedEntry) {
+        applySyllableVisualState(selectedEntry, currentTime);
+      }
     }
-    const firstEntry = runtime.index.syllableById.get(entry.firstSyllableId);
-    const lastEntry = runtime.index.syllableById.get(entry.lastSyllableId);
-    const start = firstEntry?.syllable.start;
-    const end = isFiniteNumber(lastEntry?.globalIndex) ? getEffectiveSyllableEnd(lastEntry.globalIndex) : null;
-    const lineActive = isFiniteNumber(start) && isFiniteNumber(end) && currentTime >= start && currentTime < end;
-    node.classList.toggle('active', lineActive || activeLineId === entry.id);
-    node.classList.toggle('selected-line', practiceTarget.kind === 'line' && practiceTarget.id === entry.id);
-  });
 
-  if (selectedEntry && selectedEntry.lineId && state.settings.autoScrollLyrics && activeLineId && runtime.lastAutoScrolledLineId !== activeLineId) {
+    if (renderState.lastSelectedWordId !== selectedWordId) {
+      const previousWord = runtime.index.wordById.get(renderState.lastSelectedWordId);
+      if (previousWord) applyWordVisualState(previousWord);
+      const currentWord = runtime.index.wordById.get(selectedWordId);
+      if (currentWord) applyWordVisualState(currentWord);
+    }
+
+    if (renderState.lastPracticeTargetKind === 'word' && renderState.lastPracticeTargetId !== practiceTarget.id) {
+      const previousPracticeWord = runtime.index.wordById.get(renderState.lastPracticeTargetId);
+      if (previousPracticeWord) applyWordVisualState(previousPracticeWord);
+    }
+    if (practiceTarget.kind === 'word') {
+      const currentPracticeWord = runtime.index.wordById.get(practiceTarget.id);
+      if (currentPracticeWord) applyWordVisualState(currentPracticeWord);
+    }
+
+    if (renderState.lastActiveLineId !== activeLineId) {
+      const previousLine = runtime.index.lineById.get(renderState.lastActiveLineId);
+      if (previousLine) applyLineVisualState(previousLine, activeLineId);
+      const currentLine = runtime.index.lineById.get(activeLineId);
+      if (currentLine) applyLineVisualState(currentLine, activeLineId);
+    }
+
+    if (renderState.lastPracticeTargetKind === 'line' && renderState.lastPracticeTargetId !== practiceTarget.id) {
+      const previousPracticeLine = runtime.index.lineById.get(renderState.lastPracticeTargetId);
+      if (previousPracticeLine) applyLineVisualState(previousPracticeLine, activeLineId);
+    }
+    if (practiceTarget.kind === 'line') {
+      const currentPracticeLine = runtime.index.lineById.get(practiceTarget.id);
+      if (currentPracticeLine) applyLineVisualState(currentPracticeLine, activeLineId);
+    }
+  }
+
+  if (selectedEntry && state.settings.autoScrollLyrics && activeLineId && runtime.lastAutoScrolledLineId !== activeLineId) {
     const activeLine = runtime.dom.lines.get(activeLineId);
     if (activeLine) {
       activeLine.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -1817,13 +2638,8 @@ function updateLyricsDynamic() {
     }
   }
 
-  // Follow sounding — only snap selection when:
-  //   (1) playback is running AND
-  //   (2) the sounding syllable has actually changed since we last snapped
-  // This lets the user freely move the selector with [ ] while paused,
-  // and also while playing as long as the sounding syllable stays the same.
   if (state.settings.followSounding) {
-    if (!els.audioPlayer.paused && soundingEntry && soundingEntry.id !== runtime.lastFollowSoundingId) {
+    if (getIsPlaying() && soundingEntry && soundingEntry.id !== runtime.lastFollowSoundingId) {
       runtime.lastFollowSoundingId = soundingEntry.id;
       if (soundingEntry.id !== state.selection.syllableId) {
         setSelectionSyllableById(soundingEntry.id, {
@@ -1834,12 +2650,19 @@ function updateLyricsDynamic() {
           fromFollowSounding: true,
         });
       }
-    } else if (els.audioPlayer.paused) {
-      // While paused, reset the tracker so that when playback resumes
-      // the next sounding syllable (even if same as before) triggers a snap.
+    } else if (!getIsPlaying()) {
       runtime.lastFollowSoundingId = null;
     }
   }
+
+  renderState.lastCurrentTime = currentTime;
+  renderState.lastSelectedSyllableId = state.selection.syllableId;
+  renderState.lastSelectedWordId = selectedWordId;
+  renderState.lastSelectedLineId = selectedLineId;
+  renderState.lastPracticeTargetKind = practiceTarget.kind;
+  renderState.lastPracticeTargetId = practiceTarget.id;
+  renderState.lastSoundingSyllableId = soundingEntry?.id || null;
+  renderState.lastActiveLineId = activeLineId;
 }
 
 function resizeCanvasToDisplaySize(canvas) {
@@ -2520,6 +3343,7 @@ function setSelectedStartTime(time) {
     return;
   }
   pushUndoSnapshot();
+  runtime.lastSetEndGesture = null;
   const newStart = roundTime(clampSyllableStart(entry.globalIndex, time));
   entry.syllable.start = newStart;
   if (isFiniteNumber(entry.syllable.end) && entry.syllable.end <= entry.syllable.start + EPSILON) {
@@ -2535,9 +3359,18 @@ function setSelectedEndTime(time) {
   if (!entry || !isFiniteNumber(time) || !isFiniteNumber(entry.syllable.start)) {
     return;
   }
+  const requestedEnd = roundTime(clampSyllableEnd(entry.globalIndex, time));
+  const nextEntry = getNextStartedEntry(entry.globalIndex);
+  const autoClear = shouldAutoClearEndOnRepeat(entry, nextEntry, requestedEnd);
   pushUndoSnapshot();
-  entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, time));
-  // If end moved past next start, remove current end and pull next start back
+  if (autoClear) {
+    entry.syllable.end = null;
+    updateLastSetEndGesture(entry, requestedEnd);
+    afterTimingMutation({ ensureViewTime: entry.syllable.start });
+    return;
+  }
+  entry.syllable.end = requestedEnd;
+  updateLastSetEndGesture(entry, requestedEnd);
   resolveOverlapAfterEndMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.end });
 }
@@ -2547,6 +3380,7 @@ function setSyllableStartById(id, time) {
   if (!entry || !isFiniteNumber(time)) {
     return;
   }
+  runtime.lastSetEndGesture = null;
   const newStart = roundTime(clampSyllableStart(entry.globalIndex, time));
   entry.syllable.start = newStart;
   if (isFiniteNumber(entry.syllable.end) && entry.syllable.end <= entry.syllable.start + EPSILON) {
@@ -2561,6 +3395,7 @@ function setSyllableEndById(id, time) {
   if (!entry || !isFiniteNumber(time) || !isFiniteNumber(entry.syllable.start)) {
     return;
   }
+  runtime.lastSetEndGesture = null;
   entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, time));
   resolveOverlapAfterEndMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.end, skipSelectionUpdate: true });
@@ -2609,6 +3444,7 @@ function clearSelectedEnd() {
     return;
   }
   pushUndoSnapshot();
+  runtime.lastSetEndGesture = null;
   entry.syllable.end = null;
   afterTimingMutation({ ensureViewTime: entry.syllable.start });
 }
@@ -2619,6 +3455,7 @@ function clearSelectedTiming({ movePrev = false } = {}) {
     return;
   }
   pushUndoSnapshot();
+  runtime.lastSetEndGesture = null;
   entry.syllable.start = null;
   entry.syllable.end = null;
   afterTimingMutation();
@@ -2633,6 +3470,7 @@ function clearTimingsFromSelectedForward() {
     return;
   }
   pushUndoSnapshot();
+  runtime.lastSetEndGesture = null;
   for (let i = entry.globalIndex; i < runtime.index.syllables.length; i += 1) {
     runtime.index.syllables[i].syllable.start = null;
     runtime.index.syllables[i].syllable.end = null;
@@ -2728,6 +3566,8 @@ function applySelectedValuesFromInputs() {
     }
   }
 
+  runtime.lastSetEndGesture = null;
+
   if (!rawPitch) {
     entry.syllable.pitch = null;
   } else {
@@ -2742,12 +3582,14 @@ function applySelectedValuesFromInputs() {
 }
 
 function afterTimingMutation({ ensureViewTime = null, skipSelectionUpdate = false } = {}) {
+  rebuildTimingCaches();
   updateSelectedEditor();
   updateSyncStatus();
   resetAudioOverlayState();
   if (isFiniteNumber(ensureViewTime)) {
     ensureTimeInView(ensureViewTime);
   }
+  markLyricsDirty();
   if (!skipSelectionUpdate) {
     updateLyricsDynamic();
   }
@@ -2768,17 +3610,25 @@ function tapFromSelected() {
 }
 
 async function seekToTime(time, { play = null } = {}) {
-  setPlayheadTimeImmediate(time);
+  const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
   if (play === true) {
-    await ensureAudioContext(true);
     try {
-      await els.audioPlayer.play();
+      await playTransport({ seekTime: clampedTime });
     } catch (error) {
       console.warn(error);
     }
   } else if (play === false) {
-    els.audioPlayer.pause();
+    pauseTransport({ time: clampedTime });
+  } else if (getIsPlaying()) {
+    restartTransportPlayback(clampedTime);
+  } else {
+    setTransportPausedTime(clampedTime);
+    resetAudioOverlayState();
+    updateTransportUi();
   }
+  markLyricsDirty();
+  updateLyricsDynamic();
+  markDirty();
 }
 
 async function jumpToTarget(target = getPracticeTarget()) {
@@ -2792,7 +3642,7 @@ async function jumpToTarget(target = getPracticeTarget()) {
 }
 
 function applyLooping() {
-  if (!state.settings.loopSelection || els.audioPlayer.paused) {
+  if (!state.settings.loopSelection || !getIsPlaying()) {
     return;
   }
   const range = getRangeForTarget();
@@ -2808,11 +3658,71 @@ function applyLooping() {
 
 function resetAudioOverlayState() {
   runtime.audioOverlay.metronomeCursorAudioTime = getCurrentTime();
+  runtime.audioOverlay.lastMetronomeSyncMs = 0;
   stopGuideVoice();
+  syncMetronomeTransport(true);
+}
+
+async function ensureMetronomeWorklet() {
+  if (!runtime.audioContext || runtime.metronomeWorkletFailed) {
+    return null;
+  }
+  if (runtime.metronomeNode) {
+    return runtime.metronomeNode;
+  }
+  if (!runtime.audioContext.audioWorklet) {
+    runtime.metronomeWorkletFailed = true;
+    return null;
+  }
+  if (!runtime.metronomeWorkletReady) {
+    runtime.metronomeWorkletReady = runtime.audioContext.audioWorklet.addModule('metronome-worklet.js')
+      .then(() => {
+        const node = new AudioWorkletNode(runtime.audioContext, 'karaoke-metronome-processor', {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+        node.connect(runtime.metronomeGain);
+        runtime.metronomeNode = node;
+        syncMetronomeTransport(true);
+        return node;
+      })
+      .catch((error) => {
+        console.warn('AudioWorklet unavailable, using metronome fallback.', error);
+        runtime.metronomeWorkletFailed = true;
+        runtime.metronomeWorkletReady = null;
+        return null;
+      });
+  }
+  return runtime.metronomeWorkletReady;
+}
+
+function syncMetronomeTransport(force = false) {
+  if (!runtime.metronomeNode || !runtime.audioContext) {
+    return;
+  }
+  runtime.metronomeNode.port.postMessage({
+    type: 'transport',
+    forceResync: force,
+    playing: !!state.settings.metronome.enabled && getIsPlaying() && runtime.audioContext.state === 'running',
+    bpm: clamp(state.settings.metronome.bpm, 20, 300),
+    offset: Number(state.settings.metronome.offset) || 0,
+    beatsPerBar: clamp(state.settings.metronome.beatsPerBar, 1, 12),
+    playbackRate: Math.max(0.1, state.settings.playbackRate),
+    anchorContextTime: getIsPlaying() ? runtime.transport.startContextTime : runtime.audioContext.currentTime,
+    anchorAudioTime: getIsPlaying() ? runtime.transport.startOffset : getCurrentTime(),
+  });
 }
 
 function scheduleMetronomeClicks() {
-  if (!state.settings.metronome.enabled || els.audioPlayer.paused || !runtime.audioContext || runtime.audioContext.state !== 'running') {
+  const metronomeActive = !!state.settings.metronome.enabled && getIsPlaying();
+  if (runtime.metronomeNode) {
+    if (!metronomeActive) {
+      runtime.audioOverlay.metronomeCursorAudioTime = getCurrentTime();
+    }
+    return;
+  }
+  if (!metronomeActive || !runtime.audioContext || runtime.audioContext.state !== 'running') {
     runtime.audioOverlay.metronomeCursorAudioTime = getCurrentTime();
     return;
   }
@@ -2852,7 +3762,7 @@ function scheduleClick(when, accent) {
   oscillator.type = 'triangle';
   oscillator.frequency.setValueAtTime(accent ? 1760 : 1320, when);
   gain.gain.setValueAtTime(0, when);
-  gain.gain.linearRampToValueAtTime((accent ? 0.9 : 0.55) * state.settings.metronome.volume, when + 0.004);
+  gain.gain.linearRampToValueAtTime(accent ? 0.9 : 0.55, when + 0.004);
   gain.gain.exponentialRampToValueAtTime(0.0001, when + 0.07);
   oscillator.connect(gain);
   gain.connect(runtime.metronomeGain);
@@ -2877,17 +3787,8 @@ function stopGuideVoice() {
 }
 
 function getSoundingPitchEntryAtTime(time) {
-  for (const entry of runtime.index.syllables) {
-    const start = entry.syllable.start;
-    const end = getEffectiveSyllableEnd(entry.globalIndex);
-    if (!isFiniteNumber(start) || !isFiniteNumber(end) || !isFiniteNumber(entry.syllable.pitch)) {
-      continue;
-    }
-    if (time >= start && time < end) {
-      return entry;
-    }
-  }
-  return null;
+  const entry = getCurrentSoundingEntryAtTime(time);
+  return entry && isFiniteNumber(entry.syllable.pitch) ? entry : null;
 }
 
 function startGuideVoice(entry) {
@@ -2919,7 +3820,7 @@ function startGuideVoice(entry) {
 }
 
 function updateGuideVoice() {
-  if (!state.settings.guideSynth.enabled || els.audioPlayer.paused || !runtime.audioContext || runtime.audioContext.state !== 'running') {
+  if (!state.settings.guideSynth.enabled || !getIsPlaying() || !runtime.audioContext || runtime.audioContext.state !== 'running') {
     stopGuideVoice();
     return;
   }
@@ -2936,7 +3837,7 @@ function updateGuideVoice() {
 }
 
 function exportJson(filename, payload) {
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
@@ -2952,17 +3853,45 @@ function exportJson(filename, payload) {
 }
 
 async function exportProject() {
+  updateSaveStatus('Preparing export…');
   const payload = serializeProject();
   if (els.embedAudioInExport.checked && audioBlob) {
+    updateSaveStatus('Embedding audio for export…');
+    let dataUrl;
+    try {
+      dataUrl = await blobToDataUrlViaWorker(audioBlob);
+    } catch (error) {
+      console.warn('Worker export packaging failed, falling back on main thread.', error);
+      dataUrl = await blobToDataUrl(audioBlob);
+    }
     payload.audio = {
-      dataUrl: await blobToDataUrl(audioBlob),
+      dataUrl,
       name: state.audioMeta.name,
       type: state.audioMeta.type,
     };
   }
+  payload.exportMeta = {
+    includesEmbeddedAudio: !!payload.audio,
+    syncedStarts: getSyncedCount(),
+    totalSyllables: runtime.index.syllables.length,
+  };
   const filename = `${sanitizeFilename(state.projectName || state.audioMeta.name || 'karaoke-project')}.json`;
   exportJson(filename, payload);
-  updateSaveStatus(`Exported ${filename}.`);
+  updateSaveStatus(`Exported ${filename}${payload.audio ? ' with audio.' : '.'}`);
+}
+
+async function importSerializedProject(serialized, { sourceLabel = 'project' } = {}) {
+  let importedBlob = null;
+  if (serialized.audio?.dataUrl) {
+    importedBlob = await dataUrlToBlob(serialized.audio.dataUrl);
+    if (serialized.audio.name) {
+      importedBlob = new File([importedBlob], serialized.audio.name, {
+        type: serialized.audio.type || importedBlob.type || 'audio/*',
+      });
+    }
+  }
+  await hydrateProject(serialized, importedBlob, { fromAutosave: false });
+  updateSaveStatus(`Imported ${sourceLabel}.`);
 }
 
 async function importProjectFile(file) {
@@ -2971,15 +3900,17 @@ async function importProjectFile(file) {
   }
   const text = await file.text();
   const parsed = JSON.parse(text);
-  let importedBlob = null;
-  if (parsed.audio?.dataUrl) {
-    importedBlob = await dataUrlToBlob(parsed.audio.dataUrl);
-    if (parsed.audio.name) {
-      importedBlob = new File([importedBlob], parsed.audio.name, { type: parsed.audio.type || importedBlob.type || 'audio/*' });
-    }
+  await importSerializedProject(parsed, { sourceLabel: file.name });
+}
+
+async function importDemoProject() {
+  updateSaveStatus('Loading demo project…');
+  const response = await fetch('./examples/demo.json', { cache: 'no-store' });
+  if (!response.ok) {
+    throw new Error(`Failed to load demo project (${response.status}).`);
   }
-  await hydrateProject(parsed, importedBlob, { fromAutosave: false });
-  updateSaveStatus(`Imported ${file.name}.`);
+  const parsed = await response.json();
+  await importSerializedProject(parsed, { sourceLabel: 'demo project' });
 }
 
 async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosave = false } = {}) {
@@ -2990,6 +3921,8 @@ async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosa
     const restoreTime = isFiniteNumber(payload.playback?.currentTime) ? payload.playback.currentTime : 0;
     uidCounter = 0;
     state = incomingProject;
+    state.settings.keybinds = sanitizeKeybinds(state.settings.keybinds);
+    state.settings.ui = sanitizeUiSettings(state.settings.ui);
     state.structure = normalizeStructure(state.structure);
     rebuildIndex();
     renderLyrics();
@@ -3000,7 +3933,7 @@ async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosa
     } else {
       audioBlob = null;
       revokeCurrentObjectUrl();
-      els.audioPlayer.pause();
+      clearTransportBuffer();
       els.audioPlayer.removeAttribute('src');
       els.audioPlayer.load();
       els.audioPlayer.playbackRate = state.settings.playbackRate;
@@ -3008,7 +3941,9 @@ async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosa
       refreshAudioMeta();
       resetAudioOverlayState();
     }
+    rebuildTimingCaches();
     updateSelectedEditor();
+    markLyricsDirty();
     updateLyricsDynamic();
     markDirty();
   } finally {
@@ -3020,11 +3955,14 @@ async function resetProject() {
   state = defaultState();
   audioBlob = null;
   revokeCurrentObjectUrl();
-  els.audioPlayer.pause();
+  clearTransportBuffer();
   els.audioPlayer.removeAttribute('src');
   els.audioPlayer.load();
   resetAudioOverlayState();
+  runtime.undoStack = [];
+  runtime.lastSetEndGesture = null;
   rebuildIndex();
+  markLyricsDirty();
   renderLyrics();
   syncInputsFromState();
   fitViewToSong();
@@ -3116,21 +4054,48 @@ function beginTimelineInteraction(event) {
 
 function getSnapTime(rawTime, excludeSyllableId, width) {
   const snapPx = runtime.snapThreshold;
-  const snapSeconds = (snapPx / Math.max(1, width - 0)) * runtime.view.duration;
-  let best = null;
+  const snapSeconds = (snapPx / Math.max(1, width)) * runtime.view.duration;
+  const points = runtime.index.snapPoints;
+  const pointTimes = runtime.index.snapPointTimes;
+  if (!points.length) {
+    return rawTime;
+  }
+  const insertion = upperBound(pointTimes, rawTime);
+  let best = rawTime;
   let bestDist = snapSeconds;
-  for (const entry of runtime.index.syllables) {
-    if (entry.id === excludeSyllableId) continue;
-    const candidates = [entry.syllable.start, entry.syllable.end].filter(isFiniteNumber);
-    for (const t of candidates) {
-      const d = Math.abs(t - rawTime);
-      if (d < bestDist) {
-        bestDist = d;
-        best = t;
+  let left = insertion - 1;
+  let right = insertion;
+  while (left >= 0 || right < points.length) {
+    let progressed = false;
+    if (left >= 0) {
+      const candidate = points[left];
+      const dist = Math.abs(candidate.time - rawTime);
+      if (dist <= bestDist) {
+        progressed = true;
+        if (candidate.syllableId !== excludeSyllableId) {
+          best = candidate.time;
+          bestDist = dist;
+        }
+        left -= 1;
       }
     }
+    if (right < points.length) {
+      const candidate = points[right];
+      const dist = Math.abs(candidate.time - rawTime);
+      if (dist <= bestDist) {
+        progressed = true;
+        if (candidate.syllableId !== excludeSyllableId) {
+          best = candidate.time;
+          bestDist = dist;
+        }
+        right += 1;
+      }
+    }
+    if (!progressed) {
+      break;
+    }
   }
-  return best !== null ? best : rawTime;
+  return best;
 }
 
 function moveTimelineInteraction(event) {
@@ -3334,75 +4299,55 @@ function onViewWheel(event) {
 
 async function togglePlayPause() {
   await ensureAudioContext(true);
-  if (els.audioPlayer.paused) {
+  if (getIsPlaying()) {
+    pauseTransport();
+  } else {
     try {
-      await els.audioPlayer.play();
+      await playTransport();
+      resetAudioOverlayState();
     } catch (error) {
       console.warn(error);
     }
-  } else {
-    els.audioPlayer.pause();
   }
-  resetAudioOverlayState();
   updateTransportUi();
 }
 
 /* INPUT HOTKEY HANDLING */
 
-const setTiming = (e, s) => tapFromSelected()
-const pausePlayback = (e, s) => togglePlayPause().catch(console.warn)
-const setStart = (e, s) => setSelectedStartTime(getCurrentTime())
-const setEnd = (e, s) => setSelectedEndTime(getCurrentTime())
-const seekBackward = (e, s) => seekToTime(getCurrentTime() - s.settings.seekStep, { play: false }).catch(console.warn)
-const seekForward = (e, s) => seekToTime(getCurrentTime() + s.settings.seekStep, { play: false }).catch(console.warn)
-const nudgeStart = (e, s) => nudgeSelectedStart(-s.settings.nudgeStep)
-const nudgeEnd = (e, s) => nudgeSelectedStart(s.settings.nudgeStep)
-const deleteTiming = (e, s) => clearSelectedTiming({ movePrev: false })
-const selectBack = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) - 1, { scroll: true })
-const selectFoward = (e, s) => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) + 1, { scroll: true })
-const selectSounding = () => {
-  const soundingEntry = getCurrentSoundingEntry();
-  if (soundingEntry) {
-    setSelectionSyllableById(soundingEntry.id, { scroll: true, ensureView: true });
-  }
-}
-const jumpToSelectedStart = (e, s) => {
-  const entry = getSelectionEntry();
-  if (!entry || !isFiniteNumber(entry.syllable.start)) return;
-  ensureTimeInView(entry.syllable.start);
-  seekToTime(entry.syllable.start, { play: s.settings.autoPlayOnJump }).catch(console.warn);
-}
-const backspaceHandler = (e, s) => {
-  if (s.focusRegion === 'pitch') return clearSelectedPitch();
-  if (e.shiftKey) return clearTimingsFromSelectedForward();
-  clearSelectedTiming({ movePrev: true });
-}
-const pitchUp = (e, s) => adjustSelectedPitch(e.shiftKey ? 12 : 1)
-const pitchDown = (e, s) => adjustSelectedPitch(e.shiftKey ? -12 : -1)
-
-const KEY_ACTIONS = {
-  'enter': setTiming,
-  'k': setTiming,
-  'z': setTiming, // for those who love clicking circles
-  'x': setTiming,
-  ' ': pausePlayback,
-  's': setStart,
-  'e': setEnd,
-  'j': seekBackward,
-  'l': seekForward,
-  ',': nudgeStart,
-  '.': nudgeEnd,
-  'delete': deleteTiming,
-  'backspace': backspaceHandler,
-  'a': selectSounding,
-  'g': jumpToSelectedStart,
-  'arrowup': pitchUp,
-  'arrowdown': pitchDown,
-  '[': selectBack,
-  'arrowleft': selectBack,
-  ']': selectFoward,
-  'arrowright': selectFoward,
+const ACTION_HANDLER_BY_ID = {
+  tapTiming: () => tapFromSelected(),
+  playPause: () => togglePlayPause().catch(console.warn),
+  setStart: () => setSelectedStartTime(getCurrentTime()),
+  setEnd: () => setSelectedEndTime(getCurrentTime()),
+  seekBackward: () => seekToTime(getCurrentTime() - state.settings.seekStep, { play: false }).catch(console.warn),
+  seekForward: () => seekToTime(getCurrentTime() + state.settings.seekStep, { play: false }).catch(console.warn),
+  nudgeBack: () => nudgeSelectedStart(-state.settings.nudgeStep),
+  nudgeForward: () => nudgeSelectedStart(state.settings.nudgeStep),
+  clearTiming: () => clearSelectedTiming({ movePrev: false }),
+  clearOrPitch: (event) => {
+    if (runtime.focusRegion === 'pitch') return clearSelectedPitch();
+    if (event.shiftKey) return clearTimingsFromSelectedForward();
+    clearSelectedTiming({ movePrev: true });
+  },
+  selectSounding: () => {
+    const soundingEntry = getCurrentSoundingEntry();
+    if (soundingEntry) {
+      setSelectionSyllableById(soundingEntry.id, { scroll: true, ensureView: true });
+    }
+  },
+  jump: () => runJumpAction(),
+  pitchUp: (event) => adjustSelectedPitch(event.shiftKey ? 12 : 1),
+  pitchDown: (event) => adjustSelectedPitch(event.shiftKey ? -12 : -1),
+  selectBack: () => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) - 1, { scroll: true }),
+  selectForward: () => selectSyllableByIndex((getSelectionEntry()?.globalIndex ?? 0) + 1, { scroll: true }),
 };
+
+function keyTokenFromEvent(event) {
+  if (event.code === 'Space') {
+    return 'space';
+  }
+  return normalizeKeyToken(event.key);
+}
 
 function isEditableTarget(target) {
   return ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
@@ -3412,16 +4357,22 @@ function isEditableTarget(target) {
 function handleKeydown(event) {
   if (isEditableTarget(event.target)) return;
 
-  // Ctrl+Z / Cmd+Z — undo
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
     event.preventDefault();
     performUndo();
     return;
   }
 
-  const key = event.key.toLowerCase();
+  if (event.ctrlKey || event.metaKey || event.altKey) {
+    return;
+  }
 
-  const action = KEY_ACTIONS[key];
+  const token = keyTokenFromEvent(event);
+  if (!token) {
+    return;
+  }
+  const actionId = runtime.keyActionLookup.get(token);
+  const action = ACTION_HANDLER_BY_ID[actionId];
   if (action) {
     event.preventDefault();
     action(event, state);
@@ -3444,10 +4395,58 @@ function attachEventListeners() {
     event.target.value = '';
   });
 
+  if (els.importProjectBtn) {
+    els.importProjectBtn.addEventListener('click', () => {
+      els.importProjectInput?.click();
+    });
+  }
+
+  if (els.importProjectMenuBtn) {
+    els.importProjectMenuBtn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const isHidden = els.importProjectMenu?.hidden !== false;
+      if (els.importProjectMenu) {
+        els.importProjectMenu.hidden = !isHidden;
+      }
+      els.importProjectMenuBtn.setAttribute('aria-expanded', isHidden ? 'true' : 'false');
+    });
+  }
+
+  document.addEventListener('click', (event) => {
+    if (!els.importProjectMenu || !els.importProjectMenuBtn) {
+      return;
+    }
+    if (event.target.closest('#importProjectSplit')) {
+      return;
+    }
+    els.importProjectMenu.hidden = true;
+    els.importProjectMenuBtn.setAttribute('aria-expanded', 'false');
+  });
+
   els.importProjectInput.addEventListener('change', (event) => {
     const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    if (!confirmDestructiveAction('Import project? This replaces the current project.')) {
+      event.target.value = '';
+      return;
+    }
     importProjectFile(file).catch((error) => console.warn(error));
     event.target.value = '';
+  });
+
+  els.importDemoProjectBtn.addEventListener('click', () => {
+    if (els.importProjectMenu) {
+      els.importProjectMenu.hidden = true;
+    }
+    if (els.importProjectMenuBtn) {
+      els.importProjectMenuBtn.setAttribute('aria-expanded', 'false');
+    }
+    if (!confirmDestructiveAction('Import demo project? This replaces the current project.')) {
+      return;
+    }
+    importDemoProject().catch((error) => console.warn(error));
   });
 
   els.exportProjectBtn.addEventListener('click', () => {
@@ -3455,7 +4454,7 @@ function attachEventListeners() {
   });
 
   els.clearProjectBtn.addEventListener('click', () => {
-    if (window.confirm('Reset the current project and clear the local autosave?')) {
+    if (confirmDestructiveAction('Reset project? This clears the current project and local autosave.')) {
       resetProject().catch((error) => console.warn(error));
     }
   });
@@ -3463,6 +4462,8 @@ function attachEventListeners() {
   els.audioPlayer.addEventListener('loadedmetadata', () => {
     if (isFiniteNumber(els.audioPlayer.duration)) {
       state.audioMeta.duration = els.audioPlayer.duration;
+      rebuildTimingCaches();
+      markLyricsDirty();
       refreshAudioMeta();
       updateTransportUi();
       fitViewToSong();
@@ -3470,29 +4471,12 @@ function attachEventListeners() {
     }
   });
 
-  els.audioPlayer.addEventListener('ended', () => {
-    stopGuideVoice();
-    updateTransportUi();
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-  });
-
-  els.audioPlayer.addEventListener('play', () => {
-    ensureAudioContext(true).catch((error) => console.warn(error));
-    resetAudioOverlayState();
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'playing';
-  });
-
-  els.audioPlayer.addEventListener('pause', () => {
-    resetAudioOverlayState();
-    stopGuideVoice();
-    if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
-  });
+  // Playback now runs through Web Audio so the song, guide tone, and metronome share one clock.
 
   els.playPauseBtn.addEventListener('click', () => togglePlayPause().catch((error) => console.warn(error)));
   els.rewindBtn.addEventListener('click', () => seekToTime(getCurrentTime() - state.settings.seekStep, { play: false }).catch((error) => console.warn(error)));
   els.forwardBtn.addEventListener('click', () => seekToTime(getCurrentTime() + state.settings.seekStep, { play: false }).catch((error) => console.warn(error)));
-  els.jumpToSelectionBtn.addEventListener('click', () => jumpToTarget().catch((error) => console.warn(error)));
-  els.jumpSelectedMiniBtn.addEventListener('click', () => jumpToTarget().catch((error) => console.warn(error)));
+  els.jumpToSelectionBtn.addEventListener('click', () => runJumpAction());
   els.loopSelectionBtn.addEventListener('click', () => {
     state.settings.loopSelection = !state.settings.loopSelection;
     updateLoopButton();
@@ -3519,6 +4503,12 @@ function attachEventListeners() {
     state.settings.playbackRate = Number(els.playbackRateInput.value);
     els.playbackRateLabel.textContent = `${state.settings.playbackRate.toFixed(2)}x`;
     els.audioPlayer.playbackRate = state.settings.playbackRate;
+    if (getIsPlaying()) {
+      restartTransportPlayback(getCurrentTime());
+    } else {
+      setTransportPausedTime(getCurrentTime());
+      syncMetronomeTransport(true);
+    }
     resetAudioOverlayState();
     scheduleAutosave();
   });
@@ -3553,6 +4543,7 @@ function attachEventListeners() {
   els.musicVolumeInput.addEventListener('input', () => {
     state.settings.musicVolume = clamp(Number(els.musicVolumeInput.value), 0, 1);
     els.audioPlayer.volume = state.settings.musicVolume;
+    applyAudioContextSettings();
     els.musicVolumeLabel.textContent = formatPercent(state.settings.musicVolume);
     scheduleAutosave();
   });
@@ -3585,9 +4576,11 @@ function attachEventListeners() {
     seekToTime(Number(els.scrubInput.value), { play: false }).catch((error) => console.warn(error));
   });
 
-  els.buildLyricsBtn.addEventListener('click', buildLyricsStructure);
-  els.sampleLyricsBtn.addEventListener('click', () => {
-    els.lyricsInput.value = DEMO_LYRICS;
+  els.buildLyricsBtn.addEventListener('click', () => {
+    const hasExistingLyrics = state.structure.length > 0 || !!state.lyricsMarkup.trim();
+    if (hasExistingLyrics && !confirmDestructiveAction('Build lyrics from source? This replaces existing lyrics and cannot be undone.')) {
+      return;
+    }
     buildLyricsStructure();
   });
 
@@ -3601,13 +4594,6 @@ function attachEventListeners() {
   els.excludeDoubleNewlines.addEventListener('change', preprocessingListener);
   els.excludeSectionLabels.addEventListener('change', preprocessingListener);
 
-  els.copyPlayheadStartBtn.addEventListener('click', () => {
-    els.selectedStartInput.value = getCurrentTime().toFixed(3);
-  });
-  els.copyPlayheadEndBtn.addEventListener('click', () => {
-    els.selectedEndInput.value = getCurrentTime().toFixed(3);
-  });
-  els.applySelectedValuesBtn.addEventListener('click', applySelectedValuesFromInputs);
   els.clearSelectedEndBtn.addEventListener('click', clearSelectedEnd);
   els.selectedStartInput.addEventListener('change', applySelectedValuesFromInputs);
   els.selectedEndInput.addEventListener('change', applySelectedValuesFromInputs);
@@ -3624,7 +4610,10 @@ function attachEventListeners() {
     state.settings.metronome.beatsPerBar = clamp(Number(els.metronomeBeatsPerBar.value), 1, 12);
     state.settings.metronome.volume = clamp(Number(els.metronomeVolume.value), 0, 1);
     els.metronomeVolumeLabel.textContent = formatPercent(state.settings.metronome.volume);
-    ensureAudioContext(false).catch((error) => console.warn(error));
+    ensureAudioContext(false)
+      .then(() => ensureMetronomeWorklet())
+      .then(() => syncMetronomeTransport(true))
+      .catch((error) => console.warn(error));
     resetAudioOverlayState();
     invalidateRenderCaches('timeline', 'pitch');
     scheduleAutosave();
@@ -3700,6 +4689,29 @@ function attachEventListeners() {
       scheduleAutosave();
     });
   }
+
+
+  document.querySelectorAll('details.panel[data-panel-id]').forEach((panel) => {
+    panel.addEventListener('toggle', () => {
+      state.settings.ui = sanitizeUiSettings(state.settings.ui);
+      state.settings.ui.collapsedPanels[panel.dataset.panelId] = !panel.open;
+      scheduleAutosave();
+    });
+  });
+
+  document.querySelectorAll('.main-section[data-section-id] .section-bar--clickable').forEach((bar) => {
+    bar.addEventListener('click', () => {
+      const section = bar.closest('.main-section');
+      if (!section) {
+        return;
+      }
+      queueMicrotask(() => {
+        state.settings.ui = sanitizeUiSettings(state.settings.ui);
+        state.settings.ui.collapsedSections[section.dataset.sectionId] = !section.classList.contains('is-open');
+        scheduleAutosave();
+      });
+    });
+  });
 
   runtime.resizeObserver = new ResizeObserver(() => {
     invalidateRenderCaches();
@@ -3795,10 +4807,10 @@ function updateMediaSession() {
   const duration = getAudioDuration();
 
   navigator.mediaSession.setActionHandler('play', () => {
-    ensureAudioContext(true).then(() => els.audioPlayer.play()).catch(console.warn);
+    playTransport().catch(console.warn);
   });
   navigator.mediaSession.setActionHandler('pause', () => {
-    els.audioPlayer.pause();
+    pauseTransport();
   });
   navigator.mediaSession.setActionHandler('seekbackward', (details) => {
     const step = details.seekOffset ?? state.settings.seekStep;
@@ -3809,11 +4821,7 @@ function updateMediaSession() {
     seekToTime(getCurrentTime() + step, { play: null }).catch(console.warn);
   });
   navigator.mediaSession.setActionHandler('seekto', (details) => {
-    if (details.fastSeek && 'fastSeek' in els.audioPlayer) {
-      els.audioPlayer.fastSeek(details.seekTime);
-    } else {
-      seekToTime(details.seekTime, { play: null }).catch(console.warn);
-    }
+    seekToTime(details.seekTime, { play: getIsPlaying() ? null : false }).catch(console.warn);
   });
   navigator.mediaSession.setActionHandler('previoustrack', () => {
     seekToTime(0, { play: null }).catch(console.warn);
@@ -3850,7 +4858,7 @@ function updateTitleFromMeta() {
 }
 
 function applyPlayheadWindowAutoscroll() {
-  if (!state.settings.autoScrollWindow || els.audioPlayer.paused) {
+  if (!state.settings.autoScrollWindow || !getIsPlaying()) {
     return;
   }
   const fullDuration = Math.max(FULL_VIEW_MIN, getProjectMaxTime());
@@ -3879,7 +4887,7 @@ function animate(ts) {
   updateLyricsDynamic();
   updateMediaSessionPosition();
   const currentTime = getCurrentTime();
-  const isPlaying = !els.audioPlayer.paused;
+  const isPlaying = getIsPlaying();
   const timeAdvanced = runtime.lastDrawnTime === null || Math.abs(currentTime - runtime.lastDrawnTime) > 1 / 240;
   const needsInteractiveRedraw = Boolean(runtime.drawDirty || runtime.drag);
   if (needsInteractiveRedraw) {
