@@ -6,6 +6,8 @@ Try it out here: https://ganyuke.github.io/syllabic-karaoke-machine/
 
 You can listen to a cool demo that I spent an hour or two timing by opening up the dropdown beside the "Import" butotn at the top.
 
+<img width="1280" height="619" alt="syllableui" src="https://github.com/user-attachments/assets/c39829fa-b14d-45ac-a302-9f5d4b02e20a" />
+
 ## Features
 
 - A waveform for scrubbing through and visualizing syllable placement across the song.
