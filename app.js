@@ -185,6 +185,7 @@ const runtime = {
   focusRegion: 'timing',
   autosaveTimer: null,
   resizeObserver: null,
+  stickyTransportResizeObserver: null,
   loadingProject: false,
   drawDirty: true,
   selectedPitchGhost: 60,
@@ -230,6 +231,7 @@ const runtime = {
 };
 
 const els = {
+  transport: document.querySelector('.transport'),
   projectName: document.getElementById('projectName'),
   audioFileInput: document.getElementById('audioFileInput'),
   importProjectBtn: document.getElementById('importProjectBtn'),
@@ -540,6 +542,29 @@ function applyUiState() {
     section.classList.toggle('is-open', !state.settings.ui.collapsedSections?.[sectionId]);
   });
   window.dispatchEvent(new Event('resize'));
+}
+
+function updateStickyTransportOffset() {
+  if (!els.transport) {
+    return;
+  }
+
+  // The transport wraps on narrow screens, so CSS needs the measured height
+  // rather than the desktop token when positioning sticky section headers.
+  const height = Math.ceil(els.transport.getBoundingClientRect().height);
+  document.documentElement.style.setProperty('--sticky-transport-h', `${height}px`);
+}
+
+function setupStickyTransportOffset() {
+  updateStickyTransportOffset();
+
+  if (window.ResizeObserver && els.transport) {
+    runtime.stickyTransportResizeObserver = new ResizeObserver(updateStickyTransportOffset);
+    runtime.stickyTransportResizeObserver.observe(els.transport);
+  }
+
+  window.addEventListener('resize', updateStickyTransportOffset);
+  window.addEventListener('orientationchange', updateStickyTransportOffset);
 }
 
 function confirmDestructiveAction(message) {
@@ -4969,6 +4994,7 @@ async function init() {
   fitViewToSong();
   syncInputsFromState();
   renderLyrics();
+  setupStickyTransportOffset();
   attachEventListeners();
   await loadAutosave();
   updateTransportUi();
