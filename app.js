@@ -9,7 +9,10 @@ const FULL_VIEW_MIN = 1;
 const VIEW_MIN_DURATION = 0.3;
 const DEFAULT_TAIL = 0.35;
 const EPSILON = 0.01;
-const TIMELINE_TRACK_HEIGHT = 46;
+const TIMELINE_CONFIG = {
+  syllableTrackHeight: 32,
+  syllableBlockInsetY: 4,
+};
 const PITCH_GUTTER = 42;
 const KANA_RE = /[\u3040-\u30ff]/;
 const LATIN_RE = /^[A-Za-z]+$/;
@@ -719,12 +722,16 @@ function invalidateRenderCaches(...keys) {
   runtime.drawDirty = true;
 }
 
-function createRenderBuffer(width, height, existingCanvas = null) {
+function createRenderBuffer(width, height, existingCanvas = null, dpr = 1) {
   const canvas = existingCanvas || document.createElement('canvas');
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
+  const pixelWidth = Math.max(1, Math.round(width * dpr));
+  const pixelHeight = Math.max(1, Math.round(height * dpr));
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
   }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return canvas;
 }
 
@@ -2709,35 +2716,35 @@ function updateLyricsDynamic() {
 
 function resizeCanvasToDisplaySize(canvas) {
   const rect = canvas.getBoundingClientRect();
-  
-  // If the canvas is collapsed/hidden, skip rendering entirely
+
+  // If the canvas is collapsed/hidden, skip rendering entirely.
   if (rect.width === 0 || rect.height === 0) {
     return { ctx: null, width: 0, height: 0, dpr: 1 };
   }
 
   const dpr = window.devicePixelRatio || 1;
-  const width = Math.max(1, Math.round(rect.width * dpr));
-  const height = Math.max(1, Math.round(rect.height * dpr));
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  const pixelWidth = Math.max(1, Math.round(width * dpr));
+  const pixelHeight = Math.max(1, Math.round(height * dpr));
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
   }
-  return {
-    ctx: canvas.getContext('2d'),
-    width,
-    height,
-    dpr,
-  };
+  const ctx = canvas.getContext('2d');
+  // Keep all drawing and hit testing in CSS pixels. The backing store is still
+  // scaled for HiDPI sharpness, but block geometry no longer changes with DPR.
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, width, height, dpr };
 }
 
 function getCanvasPoint(event, canvas) {
   const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
   return {
-    x: (event.clientX - rect.left) * dpr,
-    y: (event.clientY - rect.top) * dpr,
-    width: rect.width * dpr,
-    height: rect.height * dpr,
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+    width: Math.max(1, Math.round(rect.width)),
+    height: Math.max(1, Math.round(rect.height)),
   };
 }
 
@@ -2789,11 +2796,12 @@ function drawBeatGrid(ctx, width, height, { gutter = 0, alpha = 0.18 } = {}) {
   ctx.restore();
 }
 
-function getTimelineBaseKey(width, height) {
+function getTimelineBaseKey(width, height, dpr = 1) {
   const m = state.settings.metronome;
   return [
     width,
     height,
+    dpr,
     runtime.view.start.toFixed(4),
     runtime.view.duration.toFixed(4),
     runtime.renderCache.waveformVersion,
@@ -2804,29 +2812,32 @@ function getTimelineBaseKey(width, height) {
   ].join('|');
 }
 
-function renderTimelineBase(ctx, width, height) {
+function renderTimelineBase(ctx, width, height, dpr = 1) {
   drawBackground(ctx, width, height);
   drawTimelineSelectionRange(ctx, width, height);
-  drawBeatGrid(ctx, width, height - TIMELINE_TRACK_HEIGHT, { alpha: 0.12 });
-  drawWaveform(ctx, width, height - TIMELINE_TRACK_HEIGHT);
+  const waveformHeight = height - TIMELINE_CONFIG.syllableTrackHeight;
+  drawBeatGrid(ctx, width, waveformHeight, { alpha: 0.12 });
+  drawWaveform(ctx, width, waveformHeight, dpr);
 }
 
-function drawTimelineBase(ctx, width, height) {
-  const key = getTimelineBaseKey(width, height);
+function drawTimelineBase(ctx, width, height, dpr = 1) {
+  const key = getTimelineBaseKey(width, height, dpr);
   const cache = runtime.renderCache.timelineBase;
   if (cache.key !== key || !cache.canvas) {
-    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    cache.canvas = createRenderBuffer(width, height, cache.canvas, dpr);
     const cacheCtx = cache.canvas.getContext('2d');
-    renderTimelineBase(cacheCtx, width, height);
+    cacheCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    renderTimelineBase(cacheCtx, width, height, dpr);
     cache.key = key;
   }
-  ctx.drawImage(cache.canvas, 0, 0);
+  ctx.drawImage(cache.canvas, 0, 0, width, height);
 }
 
-function getOverviewBaseKey(width, height, fullDuration) {
+function getOverviewBaseKey(width, height, fullDuration, dpr = 1) {
   return [
     width,
     height,
+    dpr,
     fullDuration.toFixed(4),
     runtime.renderCache.waveformVersion,
   ].join('|');
@@ -2844,25 +2855,27 @@ function renderOverviewBase(ctx, width, height, fullDuration) {
   }
 }
 
-function drawOverviewBase(ctx, width, height, fullDuration) {
-  const key = getOverviewBaseKey(width, height, fullDuration);
+function drawOverviewBase(ctx, width, height, fullDuration, dpr = 1) {
+  const key = getOverviewBaseKey(width, height, fullDuration, dpr);
   const cache = runtime.renderCache.overviewBase;
   if (cache.key !== key || !cache.canvas) {
-    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    cache.canvas = createRenderBuffer(width, height, cache.canvas, dpr);
     const cacheCtx = cache.canvas.getContext('2d');
+    cacheCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     renderOverviewBase(cacheCtx, width, height, fullDuration);
     cache.key = key;
   }
-  ctx.drawImage(cache.canvas, 0, 0);
+  ctx.drawImage(cache.canvas, 0, 0, width, height);
 }
 
-function getPitchBaseKey(width, height) {
+function getPitchBaseKey(width, height, dpr = 1) {
   const m = state.settings.metronome;
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
   return [
     width,
     height,
+    dpr,
     runtime.view.start.toFixed(4),
     runtime.view.duration.toFixed(4),
     minPitch,
@@ -2887,23 +2900,24 @@ function renderPitchBase(ctx, width, height) {
     ctx.fillStyle = isBlack ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.02)';
     ctx.fillRect(PITCH_GUTTER, y, width - PITCH_GUTTER, rowHeight);
     ctx.fillStyle = 'rgba(0,0,0,0.38)';
-    ctx.font = `${10 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
+    ctx.font = `10px ${CANVAS_FONT_FAMILY}`;
     ctx.fillText(noteNameFromMidi(pitch), 6, y + rowHeight * 0.72);
   }
   ctx.restore();
   drawBeatGrid(ctx, width, height, { gutter: PITCH_GUTTER, alpha: 0.12 });
 }
 
-function drawPitchBase(ctx, width, height) {
-  const key = getPitchBaseKey(width, height);
+function drawPitchBase(ctx, width, height, dpr = 1) {
+  const key = getPitchBaseKey(width, height, dpr);
   const cache = runtime.renderCache.pitchBase;
   if (cache.key !== key || !cache.canvas) {
-    cache.canvas = createRenderBuffer(width, height, cache.canvas);
+    cache.canvas = createRenderBuffer(width, height, cache.canvas, dpr);
     const cacheCtx = cache.canvas.getContext('2d');
+    cacheCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
     renderPitchBase(cacheCtx, width, height);
     cache.key = key;
   }
-  ctx.drawImage(cache.canvas, 0, 0);
+  ctx.drawImage(cache.canvas, 0, 0, width, height);
 }
 
 
@@ -2915,9 +2929,10 @@ const TIMELINE_WAVEFORM_MAX_PX_PER_SECOND = 8192;
 const TIMELINE_WAVEFORM_MAX_TILES = 48;
 const TIMELINE_WAVEFORM_DIRECT_MAX_PEAKS_PER_PIXEL = 6;
 
-function getTimelineWaveformTileCacheKey(height, duration) {
+function getTimelineWaveformTileCacheKey(height, duration, dpr = 1) {
   return [
     height,
+    dpr,
     duration.toFixed(4),
     runtime.renderCache.waveformVersion,
   ].join('|');
@@ -2934,7 +2949,7 @@ function quantizeTimelineWaveformTileWidth(width) {
   return 2 ** Math.round(Math.log2(Math.max(1, target)));
 }
 
-function getTimelineWaveformTileConfig(width, height, visibleDuration, duration) {
+function getTimelineWaveformTileConfig(width, height, visibleDuration, duration, dpr = 1) {
   const tileWidth = quantizeTimelineWaveformTileWidth(Math.max(1, width));
   const targetPxPerSecond = (Math.max(1, width) / Math.max(VIEW_MIN_DURATION, visibleDuration)) * TIMELINE_WAVEFORM_TILE_OVERSCAN;
   const pxPerSecond = quantizeTimelineWaveformPxPerSecond(targetPxPerSecond);
@@ -2946,6 +2961,7 @@ function getTimelineWaveformTileConfig(width, height, visibleDuration, duration)
     tileCount,
     width: tileWidth,
     height,
+    dpr,
   };
 }
 
@@ -2972,10 +2988,11 @@ function getTimelineWaveformTile(cacheKey, tileIndex, config) {
   const level = getWaveformLevelForDensity(levels, basePeaksPerPixel) || levels[0];
   const tileStart = tileIndex * config.tileDuration;
   const tileEnd = Math.min(duration, tileStart + config.tileDuration);
-  const canvas = createRenderBuffer(config.width, Math.max(1, config.height), null);
+  const canvas = createRenderBuffer(config.width, Math.max(1, config.height), null, config.dpr);
   const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawWaveformFromLevel(ctx, canvas.width, canvas.height, level, tileStart, Math.max(VIEW_MIN_DURATION, tileEnd - tileStart), duration);
+  ctx.setTransform(config.dpr, 0, 0, config.dpr, 0, 0);
+  ctx.clearRect(0, 0, config.width, config.height);
+  drawWaveformFromLevel(ctx, config.width, config.height, level, tileStart, Math.max(VIEW_MIN_DURATION, tileEnd - tileStart), duration);
   const entry = {
     canvas,
     start: tileStart,
@@ -3026,12 +3043,12 @@ function drawWaveformFromLevel(ctx, width, height, level, visibleStart, visibleD
   });
 }
 
-function drawWaveform(ctx, width, height) {
+function drawWaveform(ctx, width, height, dpr = 1) {
   const peaks = normalizeWaveformPeaks(state.waveformPeaks);
   if (!peaks) {
     ctx.save();
     ctx.fillStyle = 'rgba(0,0,0,0.28)';
-    ctx.font = `${12 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
+    ctx.font = `12px ${CANVAS_FONT_FAMILY}`;
     ctx.fillText('Load audio to show the waveform.', 16, height / 2);
     ctx.restore();
     return;
@@ -3048,8 +3065,8 @@ function drawWaveform(ctx, width, height) {
     return;
   }
 
-  const config = getTimelineWaveformTileConfig(width, height, visibleDuration, duration);
-  const cacheKey = getTimelineWaveformTileCacheKey(height, duration);
+  const config = getTimelineWaveformTileConfig(width, height, visibleDuration, duration, dpr);
+  const cacheKey = getTimelineWaveformTileCacheKey(height, duration, dpr);
   const startTile = Math.max(0, Math.floor(visibleStart / config.tileDuration) - 1);
   const endTile = Math.min(config.tileCount - 1, Math.ceil((visibleStart + visibleDuration) / config.tileDuration));
 
@@ -3100,8 +3117,8 @@ function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {})
   if (rebuildHitboxes) {
     runtime.timelineHitboxes = [];
   }
-  const trackY = height - TIMELINE_TRACK_HEIGHT;
-  const trackHeight = TIMELINE_TRACK_HEIGHT - 8;
+  const trackY = height - TIMELINE_CONFIG.syllableTrackHeight + TIMELINE_CONFIG.syllableBlockInsetY;
+  const trackHeight = TIMELINE_CONFIG.syllableTrackHeight - TIMELINE_CONFIG.syllableBlockInsetY * 2;
   const selected = getSelectionEntry();
   const soundingEntry = getCurrentSoundingEntry();
   runtime.index.syllables.forEach((entry) => {
@@ -3140,7 +3157,7 @@ function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {})
     }
     if (w > 20) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
+      ctx.font = `11px ${CANVAS_FONT_FAMILY}`;
       ctx.fillText(entry.syllable.text, x1 + 6, y + trackHeight / 2 + 4);
     }
     ctx.restore();
@@ -3157,7 +3174,7 @@ function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {})
     }
 
     if (isSelected) {
-      const handleSize = 8 * (window.devicePixelRatio || 1);
+      const handleSize = 8;
       if (rebuildHitboxes) {
         runtime.timelineHitboxes.push({
           type: 'start-handle',
@@ -3199,7 +3216,7 @@ function drawTimelineBlocks(ctx, width, height, { rebuildHitboxes = true } = {})
         const sx = timeToX(t, width);
         ctx.beginPath();
         ctx.moveTo(sx, 0);
-        ctx.lineTo(sx, height - TIMELINE_TRACK_HEIGHT);
+        ctx.lineTo(sx, height - TIMELINE_CONFIG.syllableTrackHeight);
         ctx.stroke();
       });
     });
@@ -3221,20 +3238,20 @@ function drawPlayhead(ctx, width, height, { gutter = 0 } = {}) {
 }
 
 function drawTimeline({ rebuildHitboxes = true } = {}) {
-  const { ctx, width, height } = resizeCanvasToDisplaySize(els.timelineCanvas);
+  const { ctx, width, height, dpr } = resizeCanvasToDisplaySize(els.timelineCanvas);
   if (!ctx) return; // Exit if hidden
 
-  drawTimelineBase(ctx, width, height);
+  drawTimelineBase(ctx, width, height, dpr);
   drawTimelineBlocks(ctx, width, height, { rebuildHitboxes });
   drawPlayhead(ctx, width, height);
 }
 
 function drawOverview() {
-  const { ctx, width, height } = resizeCanvasToDisplaySize(els.overviewCanvas);
+  const { ctx, width, height, dpr } = resizeCanvasToDisplaySize(els.overviewCanvas);
   if (!ctx) return; // Exit if hidden
 
   const fullDuration = getProjectMaxTime();
-  drawOverviewBase(ctx, width, height, fullDuration);
+  drawOverviewBase(ctx, width, height, fullDuration, dpr);
   const viewportX = (runtime.view.start / fullDuration) * width;
   const viewportW = Math.max(12, (runtime.view.duration / fullDuration) * width);
   runtime.overviewViewportHitbox = {
@@ -3280,10 +3297,10 @@ function getGhostPitchForSelected() {
 }
 
 function drawPitchGuide({ rebuildHitboxes = true } = {}) {
-  const { ctx, width, height } = resizeCanvasToDisplaySize(els.pitchCanvas);
+  const { ctx, width, height, dpr } = resizeCanvasToDisplaySize(els.pitchCanvas);
   if (!ctx) return; // Exit if hidden
 
-  drawPitchBase(ctx, width, height);
+  drawPitchBase(ctx, width, height, dpr);
   const minPitch = Math.min(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const maxPitch = Math.max(state.settings.pitchRange.min, state.settings.pitchRange.max);
   const rowCount = Math.max(1, maxPitch - minPitch + 1);
@@ -3338,7 +3355,7 @@ function drawPitchGuide({ rebuildHitboxes = true } = {}) {
     ctx.setLineDash([]);
     if (w > 28) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
-      ctx.font = `${11 * (window.devicePixelRatio || 1)}px ${CANVAS_FONT_FAMILY}`;
+      ctx.font = `11px ${CANVAS_FONT_FAMILY}`;
       ctx.fillText(`${entry.syllable.text} · ${noteNameFromMidi(pitch)}`, x1 + 6, y + h * 0.66);
     }
     ctx.restore();
@@ -4287,7 +4304,7 @@ function applyEdgeScroll(ts) {
   const { pointerX, width, gutter } = runtime.edgeScroll;
   const usableWidth = Math.max(1, width - gutter);
   const localX = pointerX - gutter;
-  const edgeZone = Math.max(24, Math.min(usableWidth * 0.12, 72 * (window.devicePixelRatio || 1)));
+  const edgeZone = Math.max(24, Math.min(usableWidth * 0.12, 72));
 
   let direction = 0;
   let intensity = 0;
