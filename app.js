@@ -187,6 +187,7 @@ const runtime = {
   resizeObserver: null,
   stickyTransportResizeObserver: null,
   loadingProject: false,
+  operationInProgress: false,
   drawDirty: true,
   selectedPitchGhost: 60,
   undoStack: [],
@@ -232,6 +233,7 @@ const runtime = {
 
 const els = {
   transport: document.querySelector('.transport'),
+  workspace: document.querySelector('.workspace'),
   projectName: document.getElementById('projectName'),
   audioFileInput: document.getElementById('audioFileInput'),
   importProjectBtn: document.getElementById('importProjectBtn'),
@@ -246,6 +248,9 @@ const els = {
   audioDurationLabel: document.getElementById('audioDurationLabel'),
   keyboardModePill: document.getElementById('keyboardModePill'),
   saveStatus: document.getElementById('saveStatus'),
+  projectLoadNotice: document.getElementById('projectLoadNotice'),
+  projectLoadMessage: document.getElementById('projectLoadMessage'),
+  projectLoadDismiss: document.getElementById('projectLoadDismiss'),
   audioPlayer: document.getElementById('audioPlayer'),
 
   playPauseBtn: document.getElementById('playPauseBtn'),
@@ -1136,6 +1141,8 @@ async function loadAutosave() {
       return;
     }
 
+    setProjectLoadMessage('Restoring saved project…');
+
     // Firefox can return a Blob from IndexedDB that is technically readable
     // but still flaky when used directly as media src. Materialize the full
     // byte payload into a fresh Blob/File before handing it to <audio>.
@@ -1175,6 +1182,7 @@ async function loadAutosave() {
   } catch (error) {
     console.error(error);
     updateSaveStatus('Could not access local project storage.');
+    throw error;
   }
 }
 
@@ -1230,6 +1238,52 @@ function updateSaveStatus(text) {
   els.saveStatus.textContent = text;
 }
 
+function setProjectLoadMessage(message) {
+  if (!runtime.operationInProgress) return;
+  els.projectLoadMessage.textContent = message;
+  updateSaveStatus(message);
+}
+
+function setProjectControlsDisabled(disabled) {
+  els.transport.inert = disabled;
+  els.workspace.inert = disabled;
+  els.workspace.setAttribute('aria-busy', String(disabled));
+  els.audioFileInput.parentElement.classList.toggle('is-disabled', disabled);
+  [els.audioFileInput, els.importProjectBtn, els.importProjectInput,
+    els.importProjectMenuBtn, els.importDemoProjectBtn, els.exportProjectBtn,
+    els.clearProjectBtn, els.projectName].forEach((control) => {
+    if (control) control.disabled = disabled;
+  });
+}
+
+async function runLoadingOperation(message, failureLabel, operation, successStatus = '') {
+  if (runtime.operationInProgress) return;
+  runtime.operationInProgress = true;
+  setProjectControlsDisabled(true);
+  els.projectLoadNotice.classList.remove('project-load-notice--error');
+  els.projectLoadNotice.setAttribute('role', 'status');
+  els.projectLoadDismiss.hidden = true;
+  els.projectLoadNotice.hidden = false;
+  setProjectLoadMessage(message);
+  try {
+    await operation();
+    els.projectLoadNotice.hidden = true;
+    if (successStatus) updateSaveStatus(successStatus);
+  } catch (error) {
+    console.error(error);
+    const detail = error instanceof Error ? error.message : String(error);
+    const failure = `${failureLabel}: ${detail}`;
+    els.projectLoadNotice.classList.add('project-load-notice--error');
+    els.projectLoadNotice.setAttribute('role', 'alert');
+    els.projectLoadMessage.textContent = failure;
+    els.projectLoadDismiss.hidden = false;
+    updateSaveStatus(failure);
+  } finally {
+    runtime.operationInProgress = false;
+    setProjectControlsDisabled(false);
+  }
+}
+
 function revokeCurrentObjectUrl() {
   if (runtime.objectUrl) {
     URL.revokeObjectURL(runtime.objectUrl);
@@ -1277,7 +1331,7 @@ async function decodeAudioBlobForWaveform(blob) {
   const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   if (OfflineCtx) {
     const offlineContext = new OfflineCtx(1, 1, 44100);
-    return offlineContext.decodeAudioData(arrayBuffer.slice(0));
+    return offlineContext.decodeAudioData(arrayBuffer);
   }
   const Ctx = window.AudioContext || window.webkitAudioContext;
   if (!Ctx) {
@@ -1285,7 +1339,7 @@ async function decodeAudioBlobForWaveform(blob) {
   }
   const tempContext = new Ctx();
   try {
-    return await tempContext.decodeAudioData(arrayBuffer.slice(0));
+    return await tempContext.decodeAudioData(arrayBuffer);
   } finally {
     if (typeof tempContext.close === 'function') {
       try {
@@ -1571,7 +1625,7 @@ function drawWaveformShape(ctx, width, height, sampleAtX, { fillStyle, strokeSty
   ctx.restore();
 }
 
-async function loadAudioBlob(blob, { restoreTime = null } = {}) {
+async function loadAudioBlob(blob, { restoreTime = null, persistAudio = true } = {}) {
   if (blob && !(blob instanceof File) && !(blob instanceof Blob)) {
     throw new Error('Invalid audio blob provided.');
   }
@@ -1600,11 +1654,13 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
     updateMediaSession();
     document.title = 'Syllable Karaoke Studio';
     // Clear the stored audio blob and save the matching empty audio metadata in one transaction.
-    try {
-      await replaceAutosaveAudio(null);
-    } catch (error) {
-      console.error('Audio autosave replacement failed:', error);
-      updateSaveStatus('Autosave failed.');
+    if (persistAudio) {
+      try {
+        await replaceAutosaveAudio(null);
+      } catch (error) {
+        console.error('Audio autosave replacement failed:', error);
+        updateSaveStatus('Autosave failed.');
+      }
     }
     return;
   }
@@ -1633,14 +1689,11 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
   setTransportPausedTime(seekTime);
   refreshAudioMeta();
 
-  let autosaveAudioReplaced = false;
-  try {
-    await replaceAutosaveAudio(blob);
-    autosaveAudioReplaced = true;
-  } catch (error) {
+  // Start persistence now, but let audio decoding proceed while IndexedDB writes.
+  const audioSavePromise = persistAudio ? replaceAutosaveAudio(blob).then(() => true, (error) => {
     console.error('Audio autosave replacement failed:', error);
-    updateSaveStatus('Autosave failed.');
-  }
+    return false;
+  }) : Promise.resolve(true);
 
   // Wait for metadata so duration is available, then restore position.
   // On Firefox, using a restored Blob too early can transiently report a bad
@@ -1669,13 +1722,15 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
     }
   }
 
+  let decodeError = null;
+  setProjectLoadMessage('Decoding audio…');
   try {
     const decoded = await decodeAudioBlobForWaveform(blob);
     runtime.transport.buffer = decoded;
     state.audioMeta.duration = decoded.duration;
     setTransportPausedTime(Math.min(seekTime, decoded.duration || seekTime));
     rebuildTimingCaches();
-    updateSaveStatus('Analyzing waveform…');
+    setProjectLoadMessage('Analyzing waveform…');
     try {
       const analysis = await analyzeWaveformInWorker(decoded);
       state.waveformPeaks = analysis.peaks;
@@ -1690,7 +1745,8 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
       invalidateRenderCaches();
     }
   } catch (error) {
-    console.warn('Could not decode waveform.', error);
+    console.warn('Could not decode audio.', error);
+    decodeError = error;
     runtime.transport.buffer = null;
     state.waveformPeaks = [];
     seedTimelineWaveformLevels(null);
@@ -1705,14 +1761,23 @@ async function loadAudioBlob(blob, { restoreTime = null } = {}) {
   resetAudioOverlayState();
   markDirty();
 
-  if (!autosaveAudioReplaced) {
+  setProjectLoadMessage('Saving project locally…');
+  const autosaveAudioReplaced = await audioSavePromise;
+  let autosaveFailed = false;
+  if (persistAudio && !autosaveAudioReplaced) {
     // Retry as a full replacement so audioMeta and the audio blob still land atomically.
     try {
       await replaceAutosaveAudio(blob);
     } catch (error) {
       console.error('Audio autosave replacement failed:', error);
-      updateSaveStatus('Autosave failed.');
+      autosaveFailed = true;
     }
+  }
+  if (decodeError) {
+    throw new Error('Audio could not be decoded for playback. The project data was loaded.');
+  }
+  if (autosaveFailed) {
+    throw new Error('Audio loaded, but local autosave failed. Export the project to keep your changes.');
   }
 }
 
@@ -3967,6 +4032,7 @@ async function exportProject() {
 async function importSerializedProject(serialized, { sourceLabel = 'project' } = {}) {
   let importedBlob = null;
   if (serialized.audio?.dataUrl) {
+    setProjectLoadMessage('Unpacking embedded audio…');
     importedBlob = await dataUrlToBlob(serialized.audio.dataUrl);
     if (serialized.audio.name) {
       importedBlob = new File([importedBlob], serialized.audio.name, {
@@ -3974,6 +4040,7 @@ async function importSerializedProject(serialized, { sourceLabel = 'project' } =
       });
     }
   }
+  setProjectLoadMessage('Building project…');
   await hydrateProject(serialized, importedBlob, { fromAutosave: false });
   updateSaveStatus(`Imported ${sourceLabel}.`);
 }
@@ -3982,17 +4049,20 @@ async function importProjectFile(file) {
   if (!file) {
     return;
   }
+  setProjectLoadMessage('Reading project file…');
   const text = await file.text();
+  setProjectLoadMessage('Parsing project file…');
   const parsed = JSON.parse(text);
   await importSerializedProject(parsed, { sourceLabel: file.name });
 }
 
 async function importDemoProject() {
-  updateSaveStatus('Loading demo project…');
-  const response = await fetch('./examples/demo.json', { cache: 'no-store' });
+  setProjectLoadMessage('Downloading demo project…');
+  const response = await fetch('./examples/demo.json');
   if (!response.ok) {
     throw new Error(`Failed to load demo project (${response.status}).`);
   }
+  setProjectLoadMessage('Parsing demo project…');
   const parsed = await response.json();
   await importSerializedProject(parsed, { sourceLabel: 'demo project' });
 }
@@ -4013,7 +4083,10 @@ async function hydrateProject(serialized, providedAudioBlob = null, { fromAutosa
     syncInputsFromState();
     fitViewToSong();
     if (providedAudioBlob) {
-      await loadAudioBlob(providedAudioBlob, { restoreTime: fromAutosave ? restoreTime : 0 });
+      await loadAudioBlob(providedAudioBlob, {
+        restoreTime: fromAutosave ? restoreTime : 0,
+        persistAudio: !fromAutosave,
+      });
     } else {
       audioBlob = null;
       revokeCurrentObjectUrl();
@@ -4439,6 +4512,7 @@ function isEditableTarget(target) {
 }
 
 function handleKeydown(event) {
+  if (runtime.operationInProgress) return;
   if (isEditableTarget(event.target)) return;
 
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
@@ -4474,7 +4548,7 @@ function attachEventListeners() {
   els.audioFileInput.addEventListener('change', (event) => {
     const file = event.target.files?.[0];
     if (file) {
-      loadAudioBlob(file).catch((error) => console.warn(error));
+      runLoadingOperation('Loading audio…', 'Could not load audio', () => loadAudioBlob(file), `Loaded ${file.name}.`);
     }
     event.target.value = '';
   });
@@ -4516,7 +4590,7 @@ function attachEventListeners() {
       event.target.value = '';
       return;
     }
-    importProjectFile(file).catch((error) => console.warn(error));
+    runLoadingOperation('Importing project…', 'Could not import project', () => importProjectFile(file));
     event.target.value = '';
   });
 
@@ -4530,7 +4604,7 @@ function attachEventListeners() {
     if (!confirmDestructiveAction('Import demo project? This replaces the current project.')) {
       return;
     }
-    importDemoProject().catch((error) => console.warn(error));
+    runLoadingOperation('Importing demo…', 'Could not import demo', importDemoProject);
   });
 
   els.exportProjectBtn.addEventListener('click', () => {
@@ -4541,6 +4615,10 @@ function attachEventListeners() {
     if (confirmDestructiveAction('Reset project? This clears the current project and local autosave.')) {
       resetProject().catch((error) => console.warn(error));
     }
+  });
+
+  els.projectLoadDismiss.addEventListener('click', () => {
+    els.projectLoadNotice.hidden = true;
   });
 
   els.audioPlayer.addEventListener('loadedmetadata', () => {
@@ -4996,7 +5074,6 @@ async function init() {
   renderLyrics();
   setupStickyTransportOffset();
   attachEventListeners();
-  await loadAutosave();
   updateTransportUi();
   setFocusRegion('timing');
   updateMediaSession();
@@ -5004,6 +5081,7 @@ async function init() {
   updateUndoButton();
   markDirty();
   requestAnimationFrame(animate);
+  await runLoadingOperation('Checking for an autosave…', 'Could not restore autosave', loadAutosave);
 }
 
 init().catch((error) => {

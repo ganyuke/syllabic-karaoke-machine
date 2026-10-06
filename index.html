@@ -55,6 +55,12 @@
     <audio id="audioPlayer" preload="metadata"></audio>
   </header>
 
+  <div id="projectLoadNotice" class="project-load-notice" role="status" aria-live="polite" hidden>
+    <span class="project-load-spinner" aria-hidden="true"></span>
+    <span id="projectLoadMessage"></span>
+    <button id="projectLoadDismiss" class="project-load-dismiss" type="button" aria-label="Dismiss message" hidden>×</button>
+  </div>
+
   <div class="transport">
     <div class="t-group">
       <button id="playPauseBtn" class="btn btn-play" title="Start or pause playback">Play</button>
