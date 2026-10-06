@@ -921,7 +921,7 @@ canvas {
 
 /* Syllables */
 .syllable {
-  --fill: 0%;
+  --fill: 0;
   position: relative;
   display: inline-flex;
   align-items: center;
@@ -939,11 +939,14 @@ canvas {
   content: '';
   position: absolute;
   inset: 2px 0;
-  width: var(--fill);
+  width: 100%;
   border-radius: 3px;
   background: linear-gradient(90deg, rgba(13,143,111,0.45), rgba(43,74,203,0.35));
+  transform: scaleX(var(--fill));
+  transform-origin: left center;
   z-index: -1;
 }
+.syllable.is-sounding::before { will-change: transform; }
 .syllable::after {
   content: '';
   position: absolute;

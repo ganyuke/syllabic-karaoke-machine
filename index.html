@@ -385,6 +385,15 @@ Auto-JP: カラオケが好き"></textarea>
       let dragging = false;
       let startX = 0;
       let startW = 0;
+      let pendingW = null;
+      let resizeFrame = 0;
+      function applySidebarWidth() {
+        resizeFrame = 0;
+        if (pendingW === null) return;
+        const width = pendingW + 'px';
+        pendingW = null;
+        if (sidebar.style.width !== width) sidebar.style.width = width;
+      }
       handle.addEventListener('pointerdown', e => {
         dragging = true;
         startX = e.clientX;
@@ -395,14 +404,18 @@ Auto-JP: カラオケが好き"></textarea>
       });
       handle.addEventListener('pointermove', e => {
         if (!dragging) return;
-        const w = Math.max(200, Math.min(520, startW + (e.clientX - startX)));
-        sidebar.style.width = w + 'px';
+        pendingW = Math.max(200, Math.min(520, startW + (e.clientX - startX)));
+        if (!resizeFrame) resizeFrame = requestAnimationFrame(applySidebarWidth);
       });
-      handle.addEventListener('pointerup', () => {
+      function endSidebarResize() {
+        if (resizeFrame) cancelAnimationFrame(resizeFrame);
+        applySidebarWidth();
         dragging = false;
         document.body.style.cursor = '';
         document.body.style.userSelect = '';
-      });
+      }
+      handle.addEventListener('pointerup', endSidebarResize);
+      handle.addEventListener('pointercancel', endSidebarResize);
     }
   </script>
 </body>

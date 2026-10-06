@@ -226,6 +226,9 @@ const runtime = {
     waveformVersion: 0,
   },
   lastDrawnTime: null,
+  pendingWheel: null,
+  pendingScrubTime: null,
+  mediaSessionPosition: null,
   keyActionLookup: new Map(),
   keybindConflicts: new Map(),
   lastSetEndGesture: null,
@@ -2332,6 +2335,7 @@ function panViewTo(start) {
 
 function setPlayheadTimeImmediate(time) {
   const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
+  if (!getIsPlaying() && clampedTime === getCurrentTime()) return;
   if (getIsPlaying()) {
     restartTransportPlayback(clampedTime);
   } else {
@@ -2345,7 +2349,8 @@ function setPlayheadTimeImmediate(time) {
 }
 
 function updateViewRangeLabel() {
-  els.viewRangeLabel.textContent = `${formatClock(runtime.view.start, { hundredths: true })} → ${formatClock(runtime.view.start + runtime.view.duration, { hundredths: true })}`;
+  const label = `${formatClock(runtime.view.start, { hundredths: true })} → ${formatClock(runtime.view.start + runtime.view.duration, { hundredths: true })}`;
+  if (els.viewRangeLabel.textContent !== label) els.viewRangeLabel.textContent = label;
 }
 
 function setSelectionSyllableById(id, { practiceKind = 'syllable', practiceId = id, scroll = true, ensureView = true, fromFollowSounding = false } = {}) {
@@ -2407,14 +2412,20 @@ function updateLoopButton() {
 function updateTransportUi() {
   const duration = Math.max(getProjectMaxTime(), getAudioDuration(), 1);
   const currentTime = getCurrentTime();
-  els.playPauseBtn.textContent = getIsPlaying() ? 'Pause' : 'Play';
-  els.currentTimeLabel.textContent = formatClock(currentTime, { hundredths: true });
-  els.remainingTimeLabel.textContent = `-${formatClock(Math.max(0, duration - currentTime), { hundredths: true })}`;
-  els.scrubInput.max = String(duration);
-  els.scrubInput.value = String(clamp(currentTime, 0, duration));
-  els.rewindBtn.textContent = `-${state.settings.seekStep}s`;
-  els.forwardBtn.textContent = `+${state.settings.seekStep}s`;
-  updateViewRangeLabel();
+  const playLabel = getIsPlaying() ? 'Pause' : 'Play';
+  const currentLabel = formatClock(currentTime, { hundredths: true });
+  const remainingLabel = `-${formatClock(Math.max(0, duration - currentTime), { hundredths: true })}`;
+  const max = String(duration);
+  const value = String(clamp(currentTime, 0, duration));
+  const rewindLabel = `-${state.settings.seekStep}s`;
+  const forwardLabel = `+${state.settings.seekStep}s`;
+  if (els.playPauseBtn.textContent !== playLabel) els.playPauseBtn.textContent = playLabel;
+  if (els.currentTimeLabel.textContent !== currentLabel) els.currentTimeLabel.textContent = currentLabel;
+  if (els.remainingTimeLabel.textContent !== remainingLabel) els.remainingTimeLabel.textContent = remainingLabel;
+  if (els.scrubInput.max !== max) els.scrubInput.max = max;
+  if (els.scrubInput.value !== value) els.scrubInput.value = value;
+  if (els.rewindBtn.textContent !== rewindLabel) els.rewindBtn.textContent = rewindLabel;
+  if (els.forwardBtn.textContent !== forwardLabel) els.forwardBtn.textContent = forwardLabel;
 }
 
 function syncInputsFromState() {
@@ -2643,7 +2654,7 @@ function applySyllableVisualState(entry, currentTime) {
   }
   const fillLabel = `${fill.toFixed(2)}%`;
   if (node.dataset.fill !== fillLabel) {
-    node.style.setProperty('--fill', fillLabel);
+    node.style.setProperty('--fill', (fill / 100).toFixed(4));
     node.dataset.fill = fillLabel;
   }
   const isSelected = entry.id === state.selection.syllableId;
@@ -3531,6 +3542,7 @@ function setSyllableStartById(id, time) {
   }
   runtime.lastSetEndGesture = null;
   const newStart = roundTime(clampSyllableStart(entry.globalIndex, time));
+  if (entry.syllable.start === newStart) return;
   entry.syllable.start = newStart;
   if (isFiniteNumber(entry.syllable.end) && entry.syllable.end <= entry.syllable.start + EPSILON) {
     entry.syllable.end = null;
@@ -3545,7 +3557,9 @@ function setSyllableEndById(id, time) {
     return;
   }
   runtime.lastSetEndGesture = null;
-  entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, time));
+  const newEnd = roundTime(clampSyllableEnd(entry.globalIndex, time));
+  if (entry.syllable.end === newEnd) return;
+  entry.syllable.end = newEnd;
   resolveOverlapAfterEndMove(entry.globalIndex);
   afterTimingMutation({ ensureViewTime: entry.syllable.end, skipSelectionUpdate: true });
 }
@@ -3661,10 +3675,9 @@ function setSelectedPitch(value) {
   }
   const newPitch = isFiniteNumber(value) ? clamp(Math.round(value), 24, 108) : null;
   const oldPitch = entry.syllable.pitch;
+  if (newPitch === oldPitch) return;
   // Only push undo when pitch actually changes (avoids flooding stack on held key)
-  if (newPitch !== oldPitch) {
-    pushUndoSnapshot();
-  }
+  pushUndoSnapshot();
   if (!isFiniteNumber(value)) {
     entry.syllable.pitch = null;
   } else {
@@ -3760,6 +3773,7 @@ function tapFromSelected() {
 
 async function seekToTime(time, { play = null } = {}) {
   const clampedTime = clamp(time, 0, Math.max(getProjectMaxTime(), getAudioDuration()));
+  if (play === false && !getIsPlaying() && clampedTime === getCurrentTime()) return;
   if (play === true) {
     try {
       await playTransport({ seekTime: clampedTime });
@@ -4259,7 +4273,14 @@ function moveTimelineInteraction(event) {
   if (!runtime.drag || runtime.drag.surface !== 'timeline') {
     return;
   }
-  const point = getCanvasPoint(event, els.timelineCanvas);
+  runtime.drag.pendingPoint = { clientX: event.clientX, clientY: event.clientY };
+}
+
+function applyPendingTimelineInteraction() {
+  if (runtime.drag?.surface !== 'timeline' || !runtime.drag.pendingPoint) return;
+  const pendingPoint = runtime.drag.pendingPoint;
+  runtime.drag.pendingPoint = null;
+  const point = getCanvasPoint(pendingPoint, els.timelineCanvas);
   const rawTime = xToTime(point.x, point.width);
   if (runtime.drag.type === 'scrub') {
     updateEdgeScrollState(point, 0);
@@ -4281,20 +4302,26 @@ function moveTimelineInteraction(event) {
     if (!entry || !isFiniteNumber(runtime.drag.startAtDragStart)) {
       return;
     }
+    const previousStart = entry.syllable.start;
+    const previousEnd = entry.syllable.end;
     const delta = rawTime - runtime.drag.originTime;
     entry.syllable.start = roundTime(clampSyllableStart(entry.globalIndex, runtime.drag.startAtDragStart + delta));
     if (isFiniteNumber(runtime.drag.endAtDragStart)) {
       entry.syllable.end = roundTime(clampSyllableEnd(entry.globalIndex, runtime.drag.endAtDragStart + delta));
     }
-    afterTimingMutation({ ensureViewTime: entry.syllable.start, skipSelectionUpdate: true });
+    if (entry.syllable.start !== previousStart || entry.syllable.end !== previousEnd) {
+      afterTimingMutation({ ensureViewTime: entry.syllable.start, skipSelectionUpdate: true });
+    }
   }
 }
 
 function endTimelineInteraction() {
   if (runtime.drag?.surface === 'timeline') {
+    applyPendingTimelineInteraction();
+    const type = runtime.drag.type;
     runtime.drag = null;
     runtime.edgeScroll.active = false;
-    scheduleAutosave();
+    if (type === 'start' || type === 'end') markDirty();
   }
 }
 
@@ -4329,16 +4356,30 @@ function moveOverviewInteraction(event) {
   if (!runtime.drag || runtime.drag.surface !== 'overview') {
     return;
   }
-  const point = getCanvasPoint(event, els.overviewCanvas);
+  runtime.drag.pendingClientX = event.clientX;
+}
+
+function applyPendingOverviewPan() {
+  if (runtime.drag?.surface !== 'overview' || runtime.drag.pendingClientX == null) return;
+  const drag = runtime.drag;
+  const clientX = drag.pendingClientX;
+  drag.pendingClientX = null;
+  const rect = els.overviewCanvas.getBoundingClientRect();
+  if (!rect.width) return;
   const fullDuration = getProjectMaxTime();
-  const deltaRatio = (point.x - runtime.drag.startX) / Math.max(1, point.width);
-  runtime.view.start = runtime.drag.startViewStart + deltaRatio * fullDuration;
-  clampView();
-  markDirty();
+  const deltaRatio = (clientX - rect.left - drag.startX) / Math.max(1, Math.round(rect.width));
+  const full = Math.max(FULL_VIEW_MIN, fullDuration);
+  const nextStart = clamp(drag.startViewStart + deltaRatio * fullDuration, 0, Math.max(0, full - runtime.view.duration));
+  if (nextStart !== runtime.view.start) {
+    runtime.view.start = nextStart;
+    updateViewRangeLabel();
+    markDirty();
+  }
 }
 
 function endOverviewInteraction() {
   if (runtime.drag?.surface === 'overview') {
+    applyPendingOverviewPan();
     runtime.drag = null;
   }
 }
@@ -4363,7 +4404,14 @@ function movePitchInteraction(event) {
   if (!runtime.drag || runtime.drag.surface !== 'pitch') {
     return;
   }
-  const point = getCanvasPoint(event, els.pitchCanvas);
+  runtime.drag.pendingPoint = { clientX: event.clientX, clientY: event.clientY };
+}
+
+function applyPendingPitchInteraction() {
+  if (runtime.drag?.surface !== 'pitch' || !runtime.drag.pendingPoint) return;
+  const pendingPoint = runtime.drag.pendingPoint;
+  runtime.drag.pendingPoint = null;
+  const point = getCanvasPoint(pendingPoint, els.pitchCanvas);
   if (runtime.drag.type === 'scrub') {
     updateEdgeScrollState(point, PITCH_GUTTER);
     setPlayheadTimeImmediate(xToTime(point.x, point.width, PITCH_GUTTER));
@@ -4377,9 +4425,9 @@ function movePitchInteraction(event) {
 
 function endPitchInteraction() {
   if (runtime.drag?.surface === 'pitch') {
+    applyPendingPitchInteraction();
     runtime.drag = null;
     runtime.edgeScroll.active = false;
-    scheduleAutosave();
   }
 }
 
@@ -4437,20 +4485,50 @@ function applyEdgeScroll(ts) {
 
 function onViewWheel(event) {
   event.preventDefault();
-  const canvas = event.currentTarget;
-  const point = getCanvasPoint(event, canvas);
-  const gutter = canvas === els.pitchCanvas ? PITCH_GUTTER : 0;
-  const usableWidth = Math.max(1, point.width - gutter);
+  const pending = runtime.pendingWheel || {
+    canvas: event.currentTarget,
+    clientX: event.clientX,
+    deltaX: 0,
+    zoomSteps: 0,
+  };
+  pending.canvas = event.currentTarget;
+  pending.clientX = event.clientX;
+  pending.deltaX += event.deltaX;
+  if (event.deltaY) pending.zoomSteps += event.deltaY < 0 ? 1 : -1;
+  runtime.pendingWheel = pending;
+}
 
-  if (event.deltaX) {
-    const panSeconds = (event.deltaX / usableWidth) * runtime.view.duration;
-    panViewTo(runtime.view.start + panSeconds);
+function applyPendingWheel() {
+  const pending = runtime.pendingWheel;
+  if (!pending) return;
+  runtime.pendingWheel = null;
+  const rect = pending.canvas.getBoundingClientRect();
+  if (!rect.width) return;
+
+  const gutter = pending.canvas === els.pitchCanvas ? PITCH_GUTTER : 0;
+  const usableWidth = Math.max(1, Math.round(rect.width) - gutter);
+  const full = Math.max(FULL_VIEW_MIN, getProjectMaxTime());
+  const oldStart = runtime.view.start;
+  const oldDuration = runtime.view.duration;
+  let start = oldStart;
+  let duration = oldDuration;
+
+  if (pending.deltaX) {
+    start = clamp(start + (pending.deltaX / usableWidth) * duration, 0, Math.max(0, full - duration));
   }
-
-  if (event.deltaY) {
-    const anchorTime = xToTime(point.x, point.width, gutter);
-    const factor = event.deltaY < 0 ? 0.8 : 1.25;
-    zoomView(factor, anchorTime);
+  if (pending.zoomSteps) {
+    const x = clamp(pending.clientX - rect.left - gutter, 0, usableWidth);
+    const ratio = x / usableWidth;
+    const anchorTime = start + ratio * duration;
+    duration = clamp(duration * 0.8 ** pending.zoomSteps, VIEW_MIN_DURATION, full);
+    start = anchorTime - ratio * duration;
+  }
+  start = clamp(start, 0, Math.max(0, full - duration));
+  if (start !== oldStart || duration !== oldDuration) {
+    runtime.view.start = start;
+    runtime.view.duration = duration;
+    updateViewRangeLabel();
+    markDirty();
   }
 }
 
@@ -4735,7 +4813,11 @@ function attachEventListeners() {
   }
 
   els.scrubInput.addEventListener('input', () => {
-    seekToTime(Number(els.scrubInput.value), { play: false }).catch((error) => console.warn(error));
+    runtime.pendingScrubTime = Number(els.scrubInput.value);
+  });
+  els.scrubInput.addEventListener('change', () => {
+    runtime.pendingScrubTime = Number(els.scrubInput.value);
+    applyPendingScrub();
   });
 
   els.buildLyricsBtn.addEventListener('click', () => {
@@ -4784,7 +4866,14 @@ function attachEventListeners() {
   els.metronomeBpm.addEventListener('change', metronomeListener);
   els.metronomeOffset.addEventListener('change', metronomeListener);
   els.metronomeBeatsPerBar.addEventListener('change', metronomeListener);
-  els.metronomeVolume.addEventListener('input', metronomeListener);
+  els.metronomeVolume.addEventListener('input', () => {
+    const volume = clamp(Number(els.metronomeVolume.value), 0, 1);
+    if (volume === state.settings.metronome.volume) return;
+    state.settings.metronome.volume = volume;
+    els.metronomeVolumeLabel.textContent = formatPercent(volume);
+    applyAudioContextSettings();
+    scheduleAutosave();
+  });
 
   els.guideSynthEnabled.addEventListener('change', () => {
     state.settings.guideSynth.enabled = els.guideSynthEnabled.checked;
@@ -4820,11 +4909,13 @@ function attachEventListeners() {
     moveOverviewInteraction(event);
     movePitchInteraction(event);
   });
-  window.addEventListener('pointerup', () => {
+  const endCanvasInteractions = () => {
     endTimelineInteraction();
     endOverviewInteraction();
     endPitchInteraction();
-  });
+  };
+  window.addEventListener('pointerup', endCanvasInteractions);
+  window.addEventListener('pointercancel', endCanvasInteractions);
   els.timelineCanvas.addEventListener('wheel', onViewWheel, { passive: false });
   els.pitchCanvas.addEventListener('wheel', onViewWheel, { passive: false });
   window.addEventListener('keydown', handleKeydown);
@@ -4953,6 +5044,7 @@ function getMetaArtworkUrl() {
 
 function updateMediaSession() {
   if (!('mediaSession' in navigator)) return;
+  runtime.mediaSessionPosition = null;
 
   const artworkUrl = getMetaArtworkUrl();
   const artwork = artworkUrl
@@ -4995,12 +5087,21 @@ function updateMediaSessionPosition() {
   if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
   const duration = getAudioDuration();
   if (!duration || !isFiniteNumber(duration) || duration <= 0) return;
+  const position = clamp(getCurrentTime(), 0, duration);
+  const rate = state.settings.playbackRate;
+  const playing = getIsPlaying();
+  const now = performance.now();
+  const previous = runtime.mediaSessionPosition;
+  if (previous && previous.duration === duration && previous.rate === rate && previous.playing === playing
+    && Math.abs(previous.position - position) < (playing ? 0.5 : 0.01)
+    && (!playing || now - previous.at < 250)) return;
   try {
     navigator.mediaSession.setPositionState({
       duration,
-      playbackRate: state.settings.playbackRate,
-      position: clamp(getCurrentTime(), 0, duration),
+      playbackRate: rate,
+      position,
     });
+    runtime.mediaSessionPosition = { duration, rate, playing, position, at: now };
   } catch {
     // setPositionState throws if duration isn't ready yet — ignore
   }
@@ -5039,7 +5140,19 @@ function applyPlayheadWindowAutoscroll() {
   }
 }
 
+function applyPendingScrub() {
+  if (runtime.pendingScrubTime === null) return;
+  const time = runtime.pendingScrubTime;
+  runtime.pendingScrubTime = null;
+  seekToTime(time, { play: false }).catch((error) => console.warn(error));
+}
+
 function animate(ts) {
+  applyPendingWheel();
+  applyPendingOverviewPan();
+  applyPendingTimelineInteraction();
+  applyPendingPitchInteraction();
+  applyPendingScrub();
   applyEdgeScroll(ts);
   applyPlayheadWindowAutoscroll();
   applyLooping();
@@ -5051,8 +5164,7 @@ function animate(ts) {
   const currentTime = getCurrentTime();
   const isPlaying = getIsPlaying();
   const timeAdvanced = runtime.lastDrawnTime === null || Math.abs(currentTime - runtime.lastDrawnTime) > 1 / 240;
-  const needsInteractiveRedraw = Boolean(runtime.drawDirty || runtime.drag);
-  if (needsInteractiveRedraw) {
+  if (runtime.drawDirty) {
     drawTimeline({ rebuildHitboxes: true });
     drawOverview();
     drawPitchGuide({ rebuildHitboxes: true });
