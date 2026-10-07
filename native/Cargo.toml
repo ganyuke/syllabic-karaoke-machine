@@ -1,0 +1,26 @@
+[package]
+name = "syllabic-karaoke-machine"
+version = "0.1.0"
+edition = "2021"
+description = "Native desktop editor for syncing lyrics to audio, down to the syllable"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+cpal = "0.15"
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "wav", "pcm", "alac", "mkv"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
